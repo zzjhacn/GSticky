@@ -76,6 +76,14 @@ echo "==> [3/4] ad-hoc 签名 + 去除隔离属性"
 codesign --force --deep --sign - "$APP"
 xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 
+# 刷新 Finder / LaunchServices 图标缓存，避免反复重建后 Finder 仍显示默认/旧图标
+touch "$APP"
+LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -x "$LSREG" ]; then
+    "$LSREG" -f "$APP" >/dev/null 2>&1 || true
+    echo "    已刷新图标缓存 (lsregister -f)"
+fi
+
 echo "==> [4/4] 启动 GSticky"
 open "$APP"
 echo "完成。应用位置: $APP"

@@ -8,7 +8,7 @@ let stickyWindowLevel = NSWindow.Level(rawValue: 100)
 // 全局热键：Ctrl + Option + G 切换便签显隐（需系统「辅助功能」授权才生效）
 let hotkeyKeyCode: UInt16 = 5 // 'G'
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDelegate {
 
     private var window: NSWindow!
     private var textView: NSTextView!
@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     private var saveTimer: Timer?
     private var globalMonitor: Any?
     private var localMonitor: Any?
+    private var ballWindow: NSWindow!
 
     // MARK: - 生命周期
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -25,6 +26,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         buildMainMenu()
         buildStatusItem()
         buildWindow()
+        buildBall()
+        setupScreenFollowing()
         loadNote()
         setupHotkey()
         // 应用图标（Finder / 强制退出窗口可见；菜单栏应用无 Dock 图标）
@@ -114,11 +117,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     }
 
     @objc private func toggleWindow() {
-        if window.isVisible {
-            window.orderOut(nil)
-        } else {
+        setNoteVisible(!window.isVisible)
+    }
+
+    // 统一的显隐状态机：便签与悬浮球互斥（显示其一即隐藏另一）
+    private func setNoteVisible(_ visible: Bool) {
+        if visible {
             window.makeKeyAndOrderFront(nil)
+            ballWindow.orderOut(nil)
+        } else {
+            window.orderOut(nil)
+            positionBallOnActiveScreen()
+            // 用 orderFront 而非 makeKey，避免抢走前台 App 焦点
+            ballWindow.orderFront(nil)
         }
+    }
+
+    // 拦截红叉关闭：便签是常驻草稿，关闭 = 隐藏（与热键/菜单隐藏一致），并唤起悬浮球
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        setNoteVisible(false)
+        return false
     }
 
     @objc private func copyAll() {
@@ -144,6 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         )
         window.title = "GSticky"
         window.isReleasedWhenClosed = false
+        window.delegate = self   // 接管关闭事件：红叉 = 隐藏便签 + 显示悬浮球
         // 关键①：高窗口层级 → 压在最上层
         window.level = stickyWindowLevel
         // 关键②：跨所有 Space（含全屏 Space）常驻
@@ -178,6 +197,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         let x = screen.visibleFrame.maxX - f.width - 20
         let y = screen.visibleFrame.maxY - f.height - 20
         window.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    // MARK: - 悬浮球（便签隐藏时出现的入口）
+    private func buildBall() {
+        let size = NSSize(width: 44, height: 44)
+        ballWindow = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        // 与便签同层级，保证在全屏 App 之上也可见；canJoinAllSpaces 让它在所有桌面/全屏 Space 都出现，
+        // 配合下方「活动屏跟随」只锚定到当前活动屏幕，等价于「当前活动屏幕右上角」
+        ballWindow.level = stickyWindowLevel
+        ballWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        ballWindow.backgroundColor = .clear
+        ballWindow.isOpaque = false
+        ballWindow.hasShadow = false
+        ballWindow.ignoresMouseEvents = false
+        ballWindow.isMovableByWindowBackground = false
+
+        let ballView = BallView()
+        ballView.onTap = { [weak self] in self?.setNoteVisible(true) }
+        ballView.onDragEnd = { [weak self] in self?.persistBallPosition() }
+        ballWindow.contentView = ballView
+
+        // 启动时不显示球（便签默认可见），仅当便签被隐藏后才出现
+        ballWindow.orderOut(nil)
+    }
+
+    // 当前活动屏幕的唯一键（用于分屏记忆落点）
+    private func screenKey() -> String {
+        if let id = NSScreen.main?.deviceDescription[NSDeviceDescriptionKey(rawValue: "NSScreenNumber")] as? UInt32 {
+            return "\(id)"
+        }
+        return "default"
+    }
+
+    // 把悬浮球放到当前活动屏幕的右上角（有记忆落点则优先）
+    private func positionBallOnActiveScreen() {
+        guard let screen = NSScreen.main else { return }
+        let r: CGFloat = 44
+        let margin: CGFloat = 16
+        let vf = screen.visibleFrame
+        var x = vf.maxX - r - margin
+        var y = vf.maxY - r - margin
+        if let saved = UserDefaults.standard.string(forKey: "ballPos_\(screenKey())") {
+            let parts = saved.split(separator: ",").compactMap { Double($0) }
+            if parts.count == 2 { x = CGFloat(parts[0]); y = CGFloat(parts[1]) }
+        }
+        ballWindow.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    // 拖动结束后，按屏幕记忆当前落点
+    private func persistBallPosition() {
+        let o = ballWindow.frame.origin
+        UserDefaults.standard.set("\(o.x),\(o.y)", forKey: "ballPos_\(screenKey())")
+    }
+
+    // 活动屏 / 切屏 / 热插拔显示器时，若球正显示则重定位到新活动屏
+    private func setupScreenFollowing() {
+        let nc = NSWorkspace.shared.notificationCenter
+        nc.addObserver(self, selector: #selector(activeScreenChanged),
+                       name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        nc.addObserver(self, selector: #selector(activeScreenChanged),
+                       name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(activeScreenChanged),
+                       name: NSApplication.didChangeScreenParametersNotification, object: nil)
+    }
+
+    @objc private func activeScreenChanged() {
+        if ballWindow.isVisible {
+            positionBallOnActiveScreen()
+        }
     }
 
     // MARK: - 载入 / 保存
@@ -226,6 +319,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             button.title = ""
             button.image = self?.statusButtonImage
+        }
+    }
+}
+
+// MARK: - 悬浮球视图（圆形 + 拖动 / 点击判别）
+final class BallView: NSView {
+    var onTap: (() -> Void)?
+    var onDragEnd: (() -> Void)?
+    private var dragStart: NSPoint?
+    private var windowStart: NSPoint?
+    private let moveThreshold: CGFloat = 3
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let r = bounds
+        let path = NSBezierPath(ovalIn: r)
+        // 半透明系统色（自动适配深浅色），仅画出圆形，超出圆形的角落天然透明；无描边，避免深色模式下出现黑边
+        NSColor.windowBackgroundColor.withAlphaComponent(0.92).setFill()
+        path.fill()
+        // 中心放品牌云标
+        if let img = NSImage(named: "icon") {
+            let s: CGFloat = 24
+            img.draw(in: NSRect(x: (r.width - s) / 2, y: (r.height - s) / 2, width: s, height: s))
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        dragStart = event.locationInWindow
+        windowStart = window?.frame.origin
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let dragStart, let windowStart, let win = window else { return }
+        let cur = event.locationInWindow
+        win.setFrameOrigin(NSPoint(x: windowStart.x + cur.x - dragStart.x,
+                                  y: windowStart.y + cur.y - dragStart.y))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { dragStart = nil; windowStart = nil }
+        guard let dragStart else { return }
+        let cur = event.locationInWindow
+        let dist = hypot(cur.x - dragStart.x, cur.y - dragStart.y)
+        if dist < moveThreshold {
+            onTap?()        // 视为点击 → 显示便签
+        } else {
+            onDragEnd?()    // 视为拖动 → 记忆落点
         }
     }
 }

@@ -1,0 +1,5 @@
+// GSticky Windows 图标资源：把 GSticky.ico 嵌入 exe，作为 RT_GROUP_ICON / RT_ICON。
+// 这样资源管理器、任务栏、Alt+Tab 显示的都是项目正式图标（与 macOS 版同源 icon.png）。
+// 图标源文件由 win/make_icon.py 从项目根目录 icon.png 生成，随源码提交。
+#define IDI_GSTICKY 101
+IDI_GSTICKY ICON "GSticky.ico"

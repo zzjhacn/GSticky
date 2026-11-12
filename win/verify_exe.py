@@ -11,7 +11,9 @@
 副作用控制：
   * 便签与托盘图标会短暂出现约 3 秒，结束后自动退出；
   * note.txt 先备份、验证后原样恢复（原本不存在则删除）；
-  * 剪贴板若含非文本格式则跳过复制检查，否则验证后恢复原文本。
+  * 剪贴板若含非文本格式则跳过复制检查，否则验证后恢复原文本；
+  * 开机自启开关检查默认跳过；--autostart 会短暂改写用户真实的 Run 项，
+    但无论成败都在 finally 中原样还原。
 """
 import ctypes
 import json
@@ -20,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import winreg
 from ctypes import wintypes as w
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -86,6 +89,7 @@ WM_COMMAND = 0x0111
 WM_HOTKEY = 0x0312
 ID_COPY_ALL = 4002
 ID_QUIT = 4003
+ID_AUTOSTART = 4004
 HOTKEY_ID = 1
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x00000008
@@ -140,6 +144,68 @@ def set_clip_text(text):
             k32.GlobalFree(h)
     u32.CloseClipboard()
     return ok
+
+
+# ---- 开机自启开关（可选端到端检查） -----------------------------------------
+# 真实发两次托盘命令，验证注册表值的写入与删除、命令格式与 exe 路径。
+# 会短暂改写用户真实的 Run 项，因此默认跳过；无论如何 finally 中原样还原。
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "GSticky"
+
+
+def read_run_value():
+    """返回 (data, type)；键或值不存在返回 None。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_QUERY_VALUE) as k:
+            return winreg.QueryValueEx(k, RUN_VALUE)
+    except FileNotFoundError:
+        return None
+
+
+def restore_run_value(state):
+    """把 Run 项恢复成 state（None 表示删除该值）。"""
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+        if state is None:
+            try:
+                winreg.DeleteValue(k, RUN_VALUE)
+            except FileNotFoundError:
+                pass
+        else:
+            winreg.SetValueEx(k, RUN_VALUE, 0, state[1], state[0])
+
+
+def check_autostart(note):
+    result = {}
+    before = read_run_value()
+    try:
+        u32.PostMessageW(note, WM_COMMAND, ID_AUTOSTART, 0)
+        time.sleep(0.35)
+        mid = read_run_value()
+        u32.PostMessageW(note, WM_COMMAND, ID_AUTOSTART, 0)
+        time.sleep(0.35)
+        after = read_run_value()
+
+        result["autostart_toggle_flips_state"] = (mid is None) != (before is None)
+        result["autostart_toggle_restores"] = (after == before)
+        # 两次快照里必有一个处于「开启」状态，用它核对命令格式与 exe 路径
+        enabled = mid if mid is not None else after
+        cmd = enabled[0] if enabled else ""
+        result["autostart_command_quoted"] = (
+            isinstance(cmd, str) and cmd.startswith('"') and cmd.endswith('"'))
+        result["autostart_command_matches_exe"] = (
+            isinstance(cmd, str) and
+            os.path.normcase(os.path.normpath(cmd.strip('"'))) ==
+            os.path.normcase(os.path.normpath(EXE)))
+        result["autostart_run_value_type"] = enabled[1] if enabled else None
+    finally:
+        try:
+            restore_run_value(before)
+        except OSError as exc:
+            result["autostart_restore_error"] = str(exc)
+        result["autostart_state_restored"] = (read_run_value() == before)
+    return result
 
 
 # ---- 悬浮球外观实证 ---------------------------------------------------------
@@ -425,6 +491,12 @@ def main():
         checks["shown_by_hotkey"] = bool(u32.IsWindowVisible(note))
         checks["ball_hidden_when_shown"] = not bool(u32.IsWindowVisible(ball))
 
+        # 开机自启开关：默认跳过，--autostart 时做「切两次 + 原样还原」的实证
+        if "--autostart" in sys.argv:
+            checks.update(check_autostart(note))
+        else:
+            checks["autostart_check"] = "skipped: 会短暂改写用户自启设置（--autostart 可强制）"
+
         # 走托盘「退出」命令，验证正常清理与退出码
         u32.PostMessageW(note, WM_COMMAND, ID_QUIT, 0)
         try:
@@ -466,6 +538,10 @@ def main():
     ]
     if checks.get("copy_all_plain_text") is not None:
         required += ["copy_all_plain_text", "copy_all_no_extra_format"]
+    if checks.get("autostart_toggle_flips_state") is not None:
+        required += ["autostart_toggle_flips_state", "autostart_toggle_restores",
+                     "autostart_command_quoted", "autostart_command_matches_exe",
+                     "autostart_state_restored"]
     ok = all(checks.get(k) is True for k in required)
     out = {"ok": ok, "exe": EXE, "checks": checks}
     print(json.dumps(out, ensure_ascii=False, indent=2))

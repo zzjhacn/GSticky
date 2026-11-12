@@ -43,6 +43,7 @@ GSticky 的解法是**治本**——内部只用纯文本存储，从根上不�
 | 唤出焦点 | `makeKeyAndOrderFront`（可直接打字） | 同语义；`win/main.cpp` 顶部 `kActivateOnShow=false` 可改为不抢焦点 |
 | 全局热键授权 | 首次需在「系统设置 → 隐私与安全性 → 辅助功能」授权 | `RegisterHotKey` 免授权 |
 | 应用图标 | `icon.png` → `AppIcon.icns` / `menubar.png` | `icon.png` → `GSticky.ico`（9 尺寸）经 `windres` 嵌入 exe，窗口 / 任务栏 / 托盘 / 资源管理器同源 |
+| 开机自启 | 未提供（可用系统「登录项」自行配置） | 托盘「开机自启」勾选开关，写 `HKCU\...\Run`，**默认关闭** |
 | 分发 | ad-hoc 签名 `.app` | 静态链接单 exe；未签名首次运行可能触发 SmartScreen |
 
 > **Windows 版明确不覆盖**：F11 / 独占全屏、PPT 放映、DXGI 全屏游戏、跨虚拟桌面跟随、提权窗口、DRM 覆盖层。这些不做设计、不做测试、不做承诺。根因是 Windows 的 `WS_EX_TOPMOST` 只是 z-order 层级带，不是 macOS 那种系统给辅助窗口的特权；日常最大化的应用窗口都是非 topmost，一次 `WS_EX_TOPMOST` 就足够，不需要定时器或重夺层级。
@@ -94,7 +95,7 @@ set "GSTICKY_GXX=[path-to-mingw64]\bin\g++.exe"
 win\build.bat
 ```
 
-流程：先用 `windres` 把 `win\GSticky.ico` 嵌成资源，再与 `win\main.cpp` 一起静态链接。产物 `dist\GSticky.exe`，静态链接单文件、编译 0 警告，只依赖系统 DLL（`USER32 / GDI32 / SHELL32 / KERNEL32 / UCRT`），无需 VC++ 运行库、无需安装包。
+流程：先用 `windres` 把 `win\GSticky.ico` 嵌成资源，再与 `win\main.cpp` 一起静态链接。产物 `dist\GSticky.exe`，静态链接单文件、编译 0 警告，只依赖系统 DLL（`USER32 / GDI32 / SHELL32 / ADVAPI32 / KERNEL32 / UCRT`），无需 VC++ 运行库、无需安装包。
 
 > `win\GSticky.ico` 已随源码提交，**日常构建不需要 Python**。只有更换 `icon.png` 才用系统 Python 跑 `win\make_icon.py` 重新生成 9 尺寸图标，再执行 `win\build.bat`。
 
@@ -105,11 +106,14 @@ win\build.bat
 | 显示 / 隐藏便签 | 菜单栏 →「显示 / 隐藏」，或 `Ctrl + Option + G` | 托盘 →「显示 / 隐藏」，或 `Ctrl + Alt + G`，或点悬浮球 |
 | 复制全部（纯文本） | 菜单栏 →「复制全部（纯文本）」 | 托盘 →「复制全部（纯文本）」 |
 | 退出 | 菜单栏 →「退出 GSticky」 | 托盘 →「退出 GSticky」 |
+| 开机自启 | — | 托盘 →「开机自启」（勾选即开，默认关闭） |
 | 关闭便签 | — | 点红叉 = 隐藏（不退出），与 macOS 一致 |
 | 移动 / 缩放 | 拖标题栏 / 拉窗口边缘 | 同左（默认停靠工作区右上角） |
 | 悬浮球 | 隐藏便签后出现；拖动调位置（按屏幕记忆），单击唤出 | 同左 |
 | 编辑 | 直接打字 | 直接打字 |
 | 标准编辑快捷键 | `⌘A / ⌘C / ⌘V / ⌘X / ⌘Z / ⌘Q` | `Ctrl+A / C / V / X / Z`（`Ctrl+A` 由代码补齐） |
+
+> **开机自启（仅 Windows）**：托盘菜单 →「开机自启」，勾选即开、取消即关，**默认关闭**。开关状态就是注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `GSticky` 值（数据为带引号的 exe 绝对路径），不需要管理员权限，也不产生额外配置文件。移动或改名 exe 后，下次启动会把注册表中的旧路径自动刷新为当前路径。直接删除 exe 前请先关掉开关，以免登录时残留一个指向失效路径的启动项。
 
 > 提示：在**目标 App** 里粘贴时若变样，那是目标 App 的行为；可改用「粘贴并匹配样式」，或先过一遍 GSticky 再粘——纯文本怎么会丢格式呢。
 
@@ -121,6 +125,8 @@ win\build.bat
 | Windows | `%APPDATA%\GSticky\note.txt` |
 
 UTF-8 明文、**无 BOM、LF 换行**，一份文件，随便备份 / 同步。两个平台完全共用格式，可跨设备同步；Windows 版载入时会把 LF 转成 Edit 控件要求的 CRLF，保存时再统一回 LF。
+
+Windows 版的开机自启开关不落文件：状态即上述注册表值（存在 = 开，不存在 = 关）。
 
 ## 自定义（可选）
 
@@ -149,7 +155,7 @@ python win/verify_exe.py
 python win/verify_icon.py
 ```
 
-`--selftest` 把结构化结果写到 `%APPDATA%\GSticky\selftest.json`（12 项布尔检查，含悬浮球图标来自资源，不碰 `note.txt`）；`verify_exe.py` 做真实启动的端到端回归（输入 → 0.5s 自动保存 → 复制 → 显隐 → `PrintWindow` 抓悬浮球做像素断言 → 退出，会自动备份并原样还原 `note.txt`，并在系统临时目录输出 `gsticky_ball_preview.png` 供肉眼核对）；`verify_icon.py` 校验 exe 内 9 帧图标资源与 256 大图标可加载。
+`--selftest` 把结构化结果写到 `%APPDATA%\GSticky\selftest.json`（13 项布尔检查，含悬浮球图标来自资源、开机自启注册表往返；自启检查用专用测试键、测完即删，不碰真实设置，也不碰 `note.txt`）；`verify_exe.py` 做真实启动的端到端回归（输入 → 0.5s 自动保存 → 复制 → 显隐 → `PrintWindow` 抓悬浮球做像素断言 → 退出，会自动备份并原样还原 `note.txt`，并在系统临时目录输出 `gsticky_ball_preview.png` 供肉眼核对）；`verify_exe.py --autostart` 额外实测托盘开关写入 / 删除注册表并原样还原用户设置（因会短暂改写真实自启项，默认跳过）；`verify_icon.py` 校验 exe 内 9 帧图标资源与 256 大图标可加载。
 
 > 验证脚本请使用 `PATH` 中的系统 Python（`python` 命令），不要使用编辑器 / 工具自带的私有 Python 运行时。
 > 完整验证记录见 **`win/VERIFICATION.md`**（唯一权威验证文档）。

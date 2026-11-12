@@ -7,7 +7,7 @@
 //   - 320x260 置顶便签，停靠工作区右上角；红叉 = 隐藏（不退出）
 //   - 纯文本编辑（Win32 Edit 天然纯文本），复制全部只写 CF_UNICODETEXT
 //   - 0.5s debounce 自动保存，UTF-8 明文，LF 换行与 macOS 共用同一份文件
-//   - Ctrl+Alt+G 全局热键；托盘常驻（显示/隐藏、复制全部、退出）
+//   - Ctrl+Alt+G 全局热键；托盘常驻（显示/隐藏、复制全部、开机自启开关、退出）
 //   - 44x44 圆形悬浮球（系统色圆底 + 品牌云标），3px 阈值区分点击/拖动，
 //     按显示器记忆落点，与便签互斥
 //
@@ -16,6 +16,8 @@
 //       exe 文件图标、窗口/任务栏、托盘、悬浮球中心图案共用这一份资源，与 macOS 版同源。
 // 自检：GSticky.exe --selftest  → %APPDATA%\GSticky\selftest.json
 // 数据：%APPDATA%\GSticky\note.txt（UTF-8 / LF，无 BOM）
+// 自启：HKCU\Software\Microsoft\Windows\CurrentVersion\Run 的 GSticky 值，
+//       由托盘「开机自启」开关管理，默认关闭；无额外配置文件、无需管理员权限。
 
 #define UNICODE
 #define _UNICODE
@@ -59,7 +61,16 @@ static const UINT kTimerFlash = 4;
 static const UINT kMsgTray = WM_APP + 1;
 static const UINT kMsgActivate = WM_APP + 2;
 static const UINT kIdShow = 4001, kIdCopyAll = 4002, kIdQuit = 4003;
+static const UINT kIdAutoStart = 4004;
 static const int  kIconId = 101;  // 必须与 win/GSticky.rc 的 IDI_GSTICKY 一致
+
+// 开机自启：HKCU Run 项是唯一状态源（不另写配置文件），无需管理员权限。
+// 值由托盘菜单开关管理，默认关闭；exe 路径变化时启动时幂等自愈。
+static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* kRunValue = L"GSticky";
+// 自检专用键：绝不读写用户真实的 Run 项，测完即删。
+static const wchar_t* kSelftestKey = L"Software\\GStickySelftest";
+static const wchar_t* kSelftestValue = L"Probe";
 
 static const COLORREF kNoteBg = RGB(255, 248, 220);   // 淡黄便签
 static const COLORREF kInk = RGB(38, 34, 26);
@@ -323,6 +334,91 @@ static bool CopyAll() {
     return ok;
 }
 
+// ---- 开机自启 -------------------------------------------------------------
+// 用 HKCU\...\Run 下的一个 REG_SZ 值，格式为 "exe 绝对路径"（带引号防空格）。
+// 它就是开关状态的唯一来源：菜单每次现读现显示，不另存 config，避免双状态不一致。
+// 不用 HKLM / 任务计划 / 服务 —— 那些要管理员权限或额外组件，与单 exe 分发相悖。
+static std::wstring ExePath() {
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD n = GetModuleFileNameW(nullptr, buf.data(), (DWORD)buf.size());
+        if (n == 0) return std::wstring();
+        if (n < buf.size() - 1) { buf.resize(n); return buf; }
+        buf.resize(buf.size() * 2);  // 超长路径：扩容重试
+    }
+}
+
+static std::wstring RunCommand(const std::wstring& exe) {
+    return L"\"" + exe + L"\"";
+}
+
+static bool ReadRegString(const wchar_t* key, const wchar_t* name, std::wstring& out) {
+    HKEY h = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key, 0, KEY_QUERY_VALUE, &h) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0, bytes = 0;
+    LONG r = RegQueryValueExW(h, name, nullptr, &type, nullptr, &bytes);
+    bool ok = false;
+    if (r == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) &&
+        bytes >= sizeof(wchar_t)) {
+        std::wstring v(bytes / sizeof(wchar_t) + 1, L'\0');
+        DWORD got = bytes;
+        if (RegQueryValueExW(h, name, nullptr, &type, (LPBYTE)v.data(), &got) == ERROR_SUCCESS) {
+            size_t z = 0;
+            while (z < v.size() && v[z] != L'\0') ++z;  // 去掉结尾 NUL
+            v.resize(z);
+            out = v;
+            ok = true;
+        }
+    }
+    RegCloseKey(h);
+    return ok;
+}
+
+static bool WriteRegString(const wchar_t* key, const wchar_t* name, const std::wstring& data) {
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &h, nullptr) != ERROR_SUCCESS) return false;
+    LONG r = RegSetValueExW(h, name, 0, REG_SZ, (const BYTE*)data.c_str(),
+                            (DWORD)((data.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(h);
+    return r == ERROR_SUCCESS;
+}
+
+static bool DeleteRegValue(const wchar_t* key, const wchar_t* name) {
+    HKEY h = nullptr;
+    // 键本身不存在即视为「已删除」
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key, 0, KEY_SET_VALUE, &h) != ERROR_SUCCESS) return true;
+    LONG r = RegDeleteValueW(h, name);
+    RegCloseKey(h);
+    return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
+}
+
+static bool AutoStartEnabled() {
+    std::wstring cur;
+    return ReadRegString(kRunKey, kRunValue, cur);
+}
+
+static bool SetAutoStart(bool enable) {
+    if (!enable) return DeleteRegValue(kRunKey, kRunValue);
+    std::wstring exe = ExePath();
+    if (exe.empty()) return false;
+    return WriteRegString(kRunKey, kRunValue, RunCommand(exe));
+}
+
+// exe 被移动 / 改名后 Run 项会指向旧路径，开机自启随之失效。
+// 只在「已开启且路径确实变了」时刷新一次；未开启时完全不碰注册表。
+// 非本程序写出的格式（不以引号开头）不擅自覆盖，尊重用户自定义命令行。
+static void RefreshAutoStartPath() {
+    std::wstring cur;
+    if (!ReadRegString(kRunKey, kRunValue, cur)) return;
+    if (cur.empty() || cur[0] != L'"') return;
+    std::wstring exe = ExePath();
+    if (exe.empty()) return;
+    std::wstring want = RunCommand(exe);
+    if (cur != want) WriteRegString(kRunKey, kRunValue, want);
+}
+
 // ---- 屏幕 / 定位 ----------------------------------------------------------
 static HMONITOR ActiveMonitor() {
     HWND fg = GetForegroundWindow();
@@ -431,6 +527,9 @@ static void ShowTrayMenu() {
                 L"显示 / 隐藏便签  (Ctrl+Alt+G)");
     AppendMenuW(menu, MF_STRING, kIdCopyAll, L"复制全部（纯文本）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (AutoStartEnabled() ? MF_CHECKED : 0), kIdAutoStart,
+                L"开机自启");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kIdQuit, L"退出 GSticky");
     SetForegroundWindow(g_note);  // 否则菜单不会自动消失
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, pt.x, pt.y, 0, g_note, nullptr);
@@ -538,8 +637,22 @@ static void RunSelfTest() {
     bool iconOk = g_iconsFromResource && g_iconBig && g_iconSmall;
     bool ballIconOk = g_iconsFromResource && g_iconBall != nullptr;
 
+    // 4) 开机自启：在专用测试键上做「写 → 读 → 删 → 确认消失」完整往返。
+    //    绝不读写用户真实的 Run 项，也不要求自启开关处于任何特定状态。
+    std::wstring probe = RunCommand(ExePath());
+    bool asWrite = probe.size() > 2 && WriteRegString(kSelftestKey, kSelftestValue, probe);
+    std::wstring asRead;
+    bool asReadOk = ReadRegString(kSelftestKey, kSelftestValue, asRead);
+    bool asDelete = DeleteRegValue(kSelftestKey, kSelftestValue);
+    std::wstring asAfter;
+    bool asGone = !ReadRegString(kSelftestKey, kSelftestValue, asAfter);
+    bool autostartRoundtrip = asWrite && asReadOk && asRead == probe && asDelete && asGone;
+    RegDeleteKeyW(HKEY_CURRENT_USER, kSelftestKey);  // 单层键，只删自己创建的，不碰任何父键
+    bool autostartEnabled = AutoStartEnabled();  // 只读真实状态，供诊断，不纳入 ok
+
     bool allOk = topmost && toolwindow && inside && above && editOk && g_hotkeyOk &&
-                 g_trayOk && g_ball && noActivate && utf8Ok && iconOk && ballIconOk;
+                 g_trayOk && g_ball && noActivate && utf8Ok && iconOk && ballIconOk &&
+                 autostartRoundtrip;
     std::string j = "{\n";
     j += "  \"ok\": " + std::string(allOk ? "true" : "false") + ",\n";
     j += "  \"mode\": \"selftest\",\n";
@@ -559,7 +672,9 @@ static void RunSelfTest() {
     JBool(j, "ball_noactivate", noActivate);
     JBool(j, "utf8_lf_roundtrip", utf8Ok);
     JBool(j, "ball_icon_from_resource", ballIconOk);
-    JBool(j, "icon_from_resource", iconOk, true);
+    JBool(j, "icon_from_resource", iconOk);
+    JBool(j, "autostart_registry_roundtrip", autostartRoundtrip);
+    JBool(j, "autostart_enabled", autostartEnabled, true);
     j += "}\n";
     WriteRawFile(g_selftestOutPath, j);
 }
@@ -590,6 +705,14 @@ static LRESULT CALLBACK NoteProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (id) {
         case kIdShow:     ToggleNote(); break;
         case kIdCopyAll:  FlashTrayTip(CopyAll() ? L"已复制全部（纯文本）" : L"复制失败"); break;
+        case kIdAutoStart: {
+            bool want = !AutoStartEnabled();  // 每次现读注册表，菜单不会记旧状态
+            if (SetAutoStart(want))
+                FlashTrayTip(want ? L"已开启开机自启" : L"已关闭开机自启");
+            else
+                FlashTrayTip(L"开机自启设置失败");
+            break;
+        }
         case kIdQuit:     if (!g_selftest) SaveNow(); DestroyWindow(hwnd); break;
         }
         return 0;
@@ -817,6 +940,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     InitDpi();
     InitPaths();
+    if (!g_selftest) RefreshAutoStartPath();  // 仅主实例、且开关已开时幂等自愈
     if (!LoadAppIcons()) {
         MessageBoxW(nullptr, L"GSticky 图标资源缺失，请用 win\\build.bat 重新构建。",
                     L"GSticky", MB_ICONERROR);

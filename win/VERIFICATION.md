@@ -24,7 +24,9 @@
 
 **图标一致性**：exe 文件图标、窗口 / 任务栏、系统托盘、悬浮球中心图案全部取自同一份 `GSticky.ico` 资源，与 macOS 版共用 `icon.png`；小尺寸用 DIB 帧保证兼容，大尺寸用 PNG 帧压缩；DPI 变化时按新缩放重取图标并重绘悬浮球。悬浮球为「系统色圆底 + 无描边 + `DrawIconEx` 居中画品牌云标」，与 macOS `BallView.draw` 同语义。
 
-**开机自启（Windows 专属）**：托盘菜单新增带勾选的「开机自启」项，**默认关闭**；勾选即写、取消即删 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `GSticky` 值（`REG_SZ`，数据为带引号的 exe 绝对路径）。注册表值是开关的唯一状态源，菜单每次现读现显示，不另存配置文件，避免两份状态不一致。选 `HKCU` 而非 `HKLM` / 任务计划 / 服务，是为了无需管理员权限、不引入额外组件、保持单 exe 分发。exe 被移动或改名后，主实例启动时会把旧路径幂等刷新为当前路径；开关未开启时完全不碰注册表，非本程序写出的命令格式也不擅自覆盖。自检在专用测试键上完成往返并测完即删，绝不读写用户真实的 Run 项。
+**开机自启（Windows 专属）**：托盘菜单新增带勾选的「开机自启」项，**默认关闭**；勾选即写、取消即删 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `GSticky` 值（`REG_SZ`，数据为带引号的 exe 绝对路径）。注册表值是开关的唯一状态源，菜单每次现读现显示，不另存配置文件，避免两份状态不一致。选 `HKCU` 而非 `HKLM` / 任务计划 / 服务，是为了无需管理员权限、不引入额外组件、保持单 exe 分发。exe 被移动或改名后，主实例启动时会把旧路径幂等刷新为当前路径；路径比较大小写不敏感（仅盘符大小写不同不会重写注册表），刷新只替换引号内的路径、保留用户追加的启动参数；开关未开启时完全不碰注册表，非本程序写出的命令格式也不擅自接管。自检在专用测试键上完成往返并测完即删，绝不读写用户真实的 Run 项。
+
+**便签窗口几何记忆（双平台）**：拖动 / 缩放结束与退出时保存 `x,y,w,h`，下次启动恢复；首次启动或记录失效时回退默认 320×260 + 工作区右上角。Windows 写 `%APPDATA%\GSticky\config.ini` 的 `[note] rect`（**逻辑像素**，与 `[ball]` 悬浮球落点同文件），靠 `WM_EXITSIZEMOVE` 与 `WM_DESTROY` 落盘，不在 `WM_SIZE` / `WM_MOVE` 里逐条写；macOS 写 `UserDefaults` 的 `noteFrame_v1`，靠 `windowDidMove` / `windowDidEndLiveResize` 与退出兜底。macOS 不用 `frameAutosaveName`，因为红叉是隐藏而非关闭，窗口不走 AppKit 的自动保存路径。两平台恢复前都做可见性校验（中心点落在某块屏幕、与该屏工作区 / 可见区域至少 1/4 面积交集），拔屏或改分辨率后不会把窗口丢到屏幕外。Windows 按逻辑像素存取，换 DPI 后视觉尺寸保持一致；自检用独立测试 ini、端到端用备份还原，均不污染用户真实配置。
 
 ## 三、验证方式（可复现）
 
@@ -33,17 +35,18 @@ dist\GSticky.exe --selftest
 ```
 ```bash
 python win/verify_exe.py
-python win/verify_exe.py --autostart
+python win/verify_exe.py --autostart --geometry
 python win/verify_icon.py
 ```
 
-> 验证脚本使用 `PATH` 中的系统 Python；不依赖第三方包。`--autostart` 为可选检查，会短暂改写用户真实的自启项并在结束时原样还原。
+> 验证脚本使用 `PATH` 中的系统 Python；不依赖第三方包。`--autostart` / `--geometry` 为可选检查，会短暂改写用户真实的自启项 / 配置文件，结束时一律原样还原。
 
 | 命令 | 覆盖内容 |
 |---|---|
-| `GSticky.exe --selftest` | 内建静态自检：topmost / toolwindow / 工作区内 / 真实 z-order 压住后建的最大化窗口 / Edit / 热键 / 托盘 / 悬浮球 / NOACTIVATE / UTF-8+LF 往返 / 图标来自资源 / 悬浮球图标来自资源 / 开机自启注册表往返。自启检查在专用测试键上完成「写 → 读 → 删 → 确认消失」并测完即删，绝不读写用户真实的 Run 项；另只读输出当前开关状态供诊断。结果写入 `%APPDATA%\GSticky\selftest.json`，并附 dpi、工作区与便签矩形几何数据；用独立临时文件，不碰 `note.txt`。 |
-| `win/verify_exe.py` | 真实启动的端到端回归：置顶与工作区几何 → `WM_CHAR` 真实输入触发 0.5s 自动保存 → UTF-8 无 BOM、仅 LF、精确落盘 → 热键显隐 → 球与便签互斥、球不抢前台焦点 → `PrintWindow(PW_RENDERFULLCONTENT)` 抓悬浮球做像素断言（近白圆底占比达标、品牌青绿像素存在、无旧黄底 / 深色方块）→ 托盘退出 `exit_code=0`。自动备份并原样还原 `note.txt`，并在系统临时目录输出 `gsticky_ball_preview.png` 供肉眼核对。 |
+| `GSticky.exe --selftest` | 内建静态自检：topmost / toolwindow / 工作区内 / 真实 z-order 压住后建的最大化窗口 / Edit / 热键 / 托盘 / 悬浮球 / NOACTIVATE / UTF-8+LF 往返 / 图标来自资源 / 悬浮球图标来自资源 / 开机自启注册表往返 / 便签几何往返。自启检查在专用测试键、几何检查在独立测试 ini 上完成「写 → 读 → 删 → 确认消失」并测完即删，绝不读写用户真实的 Run 项或 `config.ini`；另只读输出当前开关状态供诊断。结果写入 `%APPDATA%\GSticky\selftest.json`，并附 dpi、工作区与便签矩形几何数据；用独立临时文件，不碰 `note.txt`。 |
+| `win/verify_exe.py` | 真实启动的端到端回归：置顶与工作区几何 → `WM_CHAR` 真实输入触发 0.5s 自动保存 → UTF-8 无 BOM、仅 LF、精确落盘 → 热键显隐 → 球与便签互斥、球不抢前台焦点 → `PrintWindow(PW_RENDERFULLCONTENT)` 抓悬浮球做像素断言（近白圆底占比达标、品牌青绿像素存在、无旧黄底 / 深色方块）→ 托盘退出 `exit_code=0`。自动备份并原样还原 `note.txt` 与 `config.ini`，并在系统临时目录输出 `gsticky_ball_preview.png` 供肉眼核对。 |
 | `win/verify_exe.py --autostart` | 在上一条基础上，真实发送两次托盘「开机自启」命令，验证 Run 值写入 / 删除、状态翻转、命令带引号且指向当前 exe；**无论成败都在 `finally` 中把用户原本的 Run 项原样还原**（含值与类型）。因会短暂改写真实自启设置，默认不跑。 |
+| `win/verify_exe.py --geometry` | 在基础回归之外，真实用 `SetWindowPos` 改动便签大小与位置 → 发 `WM_EXITSIZEMOVE` 触发落盘 → 托盘退出 → 重启 exe → 断言矩形恢复（容差覆盖 DPI 逻辑像素换算与 DWM 不可见边框）；同时确认 `[note] rect` 已写入、两次 `clean_exit=0`。**无论成败都在 `finally` 中把 `config.ini` 与 `note.txt` 原样还原**（原本不存在则删除）。因会重启 exe 并改写真实配置，默认不跑。 |
 | `win/verify_icon.py` | 校验 exe 内 `RT_GROUP_ICON` / `RT_ICON` 帧数与尺寸，32×32（DIB 帧）和 256×256（PNG 帧）均可被系统加载且含非透明像素，导出 256 预览 PNG 供核对图案与透明背景。 |
 
 悬浮球必须用 `PrintWindow` 抓窗口自身绘制结果：它是 `WS_EX_LAYERED` 窗口，由 DWM 独立合成，直接 `GetDC(NULL)+BitBlt` 抓屏只会得到桌面壁纸。抓取有效性判据为「近白圆底占比达标」，避免把背景误判成品牌色。
@@ -54,5 +57,7 @@ python win/verify_icon.py
 - 悬浮球圆沿用 GDI `Ellipse` 绘制，无抗锯齿；macOS 版 `NSBezierPath` 有抗锯齿，高分屏下 Windows 圆形边缘略呈阶梯，不影响图案与功能。
 - 开机自启是「当前用户登录后由 Explorer 执行 `HKCU\...\Run` 项」，不是系统服务，也不会在未登录 / 锁屏状态下启动；不支持为所有用户启用、延迟启动或提权运行——这些都需要管理员权限或额外组件，与单 exe 分发的取舍相悖。
 - 删除或移动 exe 前应先在托盘关掉「开机自启」：否则登录时会残留一个指向失效路径的启动项，需手动删除 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `GSticky` 值。程序本身不提供卸载器。
+- 窗口几何按逻辑像素存取，换 DPI 后视觉尺寸保持一致；多屏混合 DPI 的复杂调度不在覆盖范围内。恢复时只保证窗口「可见可用」（中心点在屏内、至少 1/4 面积落在工作区），不会强行把用户拖到屏幕边缘外的位置夹回工作区；记录损坏或尺寸越界时回退默认 320×260 + 右上角。
+- macOS 侧的几何记忆改动**未在 macOS 真机编译 / 运行验证**：本机无 Xcode / `swiftc`，只做静态语法核对与构建脚本路径检查。需在 Mac 上执行 `bash macos/build.sh` 后，实测「拖动 / 缩放 → 退出 → 重启 → 位置与大小恢复」。
 - 真实应用窗口最大化、中文输入法、多屏混合 DPI、长时间运行稳定性，仍需日常使用确认。
 - macOS 构建脚本需在 macOS 环境执行（依赖 `swiftc` / `sips` / `iconutil` / `codesign`），Windows 侧只做语法与路径可达性核对。

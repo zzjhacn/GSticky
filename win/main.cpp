@@ -10,12 +10,15 @@
 //   - Ctrl+Alt+G 全局热键；托盘常驻（显示/隐藏、复制全部、开机自启开关、退出）
 //   - 44x44 圆形悬浮球（系统色圆底 + 品牌云标），3px 阈值区分点击/拖动，
 //     按显示器记忆落点，与便签互斥
+//   - 便签窗口的大小与位置持久化：拖动/缩放结束及退出时写入 config.ini，
+//     下次启动恢复；按逻辑像素存储以适配 DPI，显示器变化后校验可见性
 //
 // 构建：win\build.bat   （MinGW-w64 / GCC，windres 嵌图标 + g++ -mwindows -static）
 // 图标：win/GSticky.ico（win/make_icon.py 从项目根 icon.png 生成）经 win/GSticky.rc 嵌入；
 //       exe 文件图标、窗口/任务栏、托盘、悬浮球中心图案共用这一份资源，与 macOS 版同源。
 // 自检：GSticky.exe --selftest  → %APPDATA%\GSticky\selftest.json
 // 数据：%APPDATA%\GSticky\note.txt（UTF-8 / LF，无 BOM）
+//       %APPDATA%\GSticky\config.ini（[ball] 悬浮球落点、[note] 便签几何）
 // 自启：HKCU\Software\Microsoft\Windows\CurrentVersion\Run 的 GSticky 值，
 //       由托盘「开机自启」开关管理，默认关闭；无额外配置文件、无需管理员权限。
 
@@ -45,6 +48,8 @@ static const UINT kNinKeySelect = 0x0401;
 // ---- 可调常量 -------------------------------------------------------------
 static const bool kActivateOnShow = true;  // 唤出时取得焦点，可直接打字（对齐 macOS makeKeyAndOrderFront）
 static const int  kBaseNoteW = 320, kBaseNoteH = 260;
+static const int  kMinNoteW = 120, kMinNoteH = 90;        // 逻辑像素；恢复下限，避免窗口缩到找不回
+static const int  kMaxNoteW = 4096, kMaxNoteH = 4096;     // 过滤损坏 / 异常配置
 static const int  kBaseBallSize = 44;
 static const int  kNoteMargin = 20, kBallMargin = 16;
 static const UINT kSaveDebounceMs = 500;
@@ -101,6 +106,10 @@ static LRESULT CALLBACK BallProc(HWND, UINT, WPARAM, LPARAM);
 
 // ---- 小工具 ---------------------------------------------------------------
 static int S(int px) { return (int)(px * g_scale + 0.5); }  // 逻辑像素 → 物理像素
+static int L(int px) { return (int)(px / g_scale + 0.5); }  // 物理像素 → 逻辑像素
+
+// 便签几何，单位一律为逻辑像素：换 DPI / 换显示器后视觉大小保持一致
+struct NoteGeom { int x = 0, y = 0, w = 0, h = 0; };
 
 static std::string ToUtf8(const std::wstring& w) {
     if (w.empty()) return std::string();
@@ -408,15 +417,21 @@ static bool SetAutoStart(bool enable) {
 
 // exe 被移动 / 改名后 Run 项会指向旧路径，开机自启随之失效。
 // 只在「已开启且路径确实变了」时刷新一次；未开启时完全不碰注册表。
-// 非本程序写出的格式（不以引号开头）不擅自覆盖，尊重用户自定义命令行。
+// Windows 路径大小写不敏感，仅盘符大小写不同不算变更（否则每次启动都会
+// 重写一次注册表）。非本程序写出的格式（不以引号开头）不擅自接管；
+// 刷新时只替换引号内的路径，保留用户可能追加的启动参数。
 static void RefreshAutoStartPath() {
     std::wstring cur;
     if (!ReadRegString(kRunKey, kRunValue, cur)) return;
     if (cur.empty() || cur[0] != L'"') return;
+    size_t close = cur.find(L'"', 1);
+    if (close == std::wstring::npos) return;
     std::wstring exe = ExePath();
     if (exe.empty()) return;
-    std::wstring want = RunCommand(exe);
-    if (cur != want) WriteRegString(kRunKey, kRunValue, want);
+    std::wstring savedPath = cur.substr(1, close - 1);
+    if (CompareStringOrdinal(savedPath.c_str(), -1, exe.c_str(), -1, TRUE) == CSTR_EQUAL)
+        return;
+    WriteRegString(kRunKey, kRunValue, L"\"" + exe + L"\"" + cur.substr(close + 1));
 }
 
 // ---- 屏幕 / 定位 ----------------------------------------------------------
@@ -439,17 +454,96 @@ static RECT WorkAreaFor(HMONITOR hm) {
     return r;
 }
 
-// 显示器配置变化后把便签拉回工作区右上角（保留用户调过的尺寸）
-// 关键：坐标基准是工作区（任务栏可见），不是屏幕矩形
-static void PositionNote() {
-    RECT wa = WorkAreaFor(ActiveMonitor());
+// ---- 便签几何（大小 / 位置持久化） ----------------------------------------
+// config.ini 的 [note] rect = "x,y,w,h"，一律逻辑像素。
+// 只在拖动/缩放结束（WM_EXITSIZEMOVE）与退出（WM_DESTROY）时落盘，
+// 不在 WM_SIZE / WM_MOVE 里逐条写；自检模式一律不碰用户 config.ini。
+static bool ParseRect4(const wchar_t* s, NoteGeom& g) {
+    int v[4] = {};
+    const wchar_t* p = s;
+    for (int i = 0; i < 4; ++i) {
+        if (!*p) return false;
+        wchar_t* end = nullptr;
+        v[i] = (int)wcstol(p, &end, 10);
+        if (end == p) return false;
+        if (i < 3) {
+            if (*end != L',') return false;
+            p = end + 1;
+        }
+    }
+    g.x = v[0]; g.y = v[1]; g.w = v[2]; g.h = v[3];
+    return true;
+}
+
+static bool LoadNoteGeometryFrom(const std::wstring& path, NoteGeom& g) {
+    wchar_t buf[128] = {};
+    GetPrivateProfileStringW(L"note", L"rect", L"", buf, 128, path.c_str());
+    if (!buf[0]) return false;
+    NoteGeom t;
+    if (!ParseRect4(buf, t)) return false;
+    if (t.w < kMinNoteW || t.h < kMinNoteH ||
+        t.w > kMaxNoteW || t.h > kMaxNoteH) return false;
+    g = t;
+    return true;
+}
+
+static bool SaveNoteGeometryTo(const std::wstring& path, const NoteGeom& g) {
+    wchar_t buf[128];
+    wsprintfW(buf, L"%d,%d,%d,%d", g.x, g.y, g.w, g.h);
+    return WritePrivateProfileStringW(L"note", L"rect", buf, path.c_str()) != FALSE;
+}
+
+static void PersistNoteGeometry() {
+    if (g_selftest || !g_note) return;
+    if (IsIconic(g_note) || IsZoomed(g_note)) return;  // 不存最小化 / 最大化态
     RECT r = {};
-    GetWindowRect(g_note, &r);
-    int w = r.right - r.left, h = r.bottom - r.top, m = S(kNoteMargin);
+    if (!GetWindowRect(g_note, &r)) return;
+    NoteGeom g = { L(r.left), L(r.top), L(r.right - r.left), L(r.bottom - r.top) };
+    if (g.w < 1 || g.h < 1) return;
+    SaveNoteGeometryTo(g_configPath, g);
+}
+
+// 恢复的矩形必须仍「可见可用」：中心点落在某个显示器上，且至少 1/4 面积
+// 落在该显示器工作区内。拔掉外接屏 / 改分辨率后，避免窗口跑到屏幕外找不回来。
+static bool GeometryVisible(const RECT& r) {
+    POINT c = { (r.left + r.right) / 2, (r.top + r.bottom) / 2 };
+    HMONITOR hm = MonitorFromPoint(c, MONITOR_DEFAULTTONULL);
+    if (!hm) return false;
+    MONITORINFOEXW mi;
+    if (!MonitorInfoFor(hm, mi)) return false;
+    RECT wa = mi.rcWork;
+    int l = r.left > wa.left ? r.left : wa.left;
+    int t = r.top > wa.top ? r.top : wa.top;
+    int rr = r.right < wa.right ? r.right : wa.right;
+    int bb = r.bottom < wa.bottom ? r.bottom : wa.bottom;
+    if (rr <= l || bb <= t) return false;
+    int want = (r.right - r.left) * (r.bottom - r.top);
+    return (rr - l) * (bb - t) >= want / 4;
+}
+
+// 启动时使用：有有效记录就恢复 x,y,w,h，否则由调用方退回默认右上角尺寸
+static bool SavedNoteRect(RECT& out) {
+    NoteGeom g;
+    if (g_selftest || !LoadNoteGeometryFrom(g_configPath, g)) return false;
+    RECT r = { S(g.x), S(g.y), S(g.x) + S(g.w), S(g.y) + S(g.h) };
+    if (!GeometryVisible(r)) return false;
+    out = r;
+    return true;
+}
+
+// 显示器配置变化：保留当前尺寸；位置优先用记忆值（仍可见时），
+// 否则回到新工作区右上角。坐标基准是工作区（任务栏可见），不是屏幕矩形。
+static void PositionNote() {
+    RECT cur = {};
+    GetWindowRect(g_note, &cur);
+    int w = cur.right - cur.left, h = cur.bottom - cur.top;
     if (w <= 0) w = S(kBaseNoteW);
     if (h <= 0) h = S(kBaseNoteH);
-    SetWindowPos(g_note, HWND_TOPMOST, wa.right - w - m, wa.top + m, w, h,
-                 SWP_NOACTIVATE);
+    RECT wa = WorkAreaFor(ActiveMonitor());
+    int x = wa.right - w - S(kNoteMargin), y = wa.top + S(kNoteMargin);
+    RECT saved = {};
+    if (SavedNoteRect(saved)) { x = saved.left; y = saved.top; }
+    SetWindowPos(g_note, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
 }
 
 static bool ParseXY(const wchar_t* s, int& x, int& y) {
@@ -650,9 +744,22 @@ static void RunSelfTest() {
     RegDeleteKeyW(HKEY_CURRENT_USER, kSelftestKey);  // 单层键，只删自己创建的，不碰任何父键
     bool autostartEnabled = AutoStartEnabled();  // 只读真实状态，供诊断，不纳入 ok
 
+    // 5) 便签几何：在独立测试 ini 上做「写 → 读 → 删 → 确认文件消失」往返，
+    //    绝不读写用户真实的 config.ini；自检窗口本身也跳过几何加载与保存。
+    std::wstring testIni = g_dataDir + L"\\selftest_geometry.ini";
+    NoteGeom geoProbe = { 123, 45, 456, 321 };
+    bool geoWrite = SaveNoteGeometryTo(testIni, geoProbe);
+    NoteGeom geoRead = {};
+    bool geoReadOk = LoadNoteGeometryFrom(testIni, geoRead);
+    bool geoEqual = geoReadOk && geoRead.x == geoProbe.x && geoRead.y == geoProbe.y &&
+                    geoRead.w == geoProbe.w && geoRead.h == geoProbe.h;
+    bool geoCleanup = DeleteFileW(testIni.c_str()) != FALSE;
+    bool geoGone = GetFileAttributesW(testIni.c_str()) == INVALID_FILE_ATTRIBUTES;
+    bool geometryRoundtrip = geoWrite && geoEqual && geoCleanup && geoGone;
+
     bool allOk = topmost && toolwindow && inside && above && editOk && g_hotkeyOk &&
                  g_trayOk && g_ball && noActivate && utf8Ok && iconOk && ballIconOk &&
-                 autostartRoundtrip;
+                 autostartRoundtrip && geometryRoundtrip;
     std::string j = "{\n";
     j += "  \"ok\": " + std::string(allOk ? "true" : "false") + ",\n";
     j += "  \"mode\": \"selftest\",\n";
@@ -674,6 +781,7 @@ static void RunSelfTest() {
     JBool(j, "ball_icon_from_resource", ballIconOk);
     JBool(j, "icon_from_resource", iconOk);
     JBool(j, "autostart_registry_roundtrip", autostartRoundtrip);
+    JBool(j, "note_geometry_roundtrip", geometryRoundtrip);
     JBool(j, "autostart_enabled", autostartEnabled, true);
     j += "}\n";
     WriteRawFile(g_selftestOutPath, j);
@@ -759,6 +867,9 @@ static LRESULT CALLBACK NoteProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(g_edit, 0, 0, cr.right, cr.bottom, TRUE);
         }
         return 0;
+    case WM_EXITSIZEMOVE:
+        PersistNoteGeometry();  // 拖动 / 缩放结束才落盘，避免拖动过程中反复写
+        return 0;
     case WM_CLOSE:
         SetNoteVisible(false, false);  // 红叉 = 隐藏便签 + 显示悬浮球，与 macOS 一致
         return 0;
@@ -786,14 +897,14 @@ static LRESULT CALLBACK NoteProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DISPLAYCHANGE:
-        if (g_noteVisible) PositionNote();       // 换显示器 / 改分辨率后拉回工作区
+        if (g_noteVisible) PositionNote();       // 换显示器 / 改分辨率：保留尺寸，位置优先用记忆值
         else PositionBall(true);
         return 0;
     case WM_SETTINGCHANGE:
         if (!g_noteVisible) PositionBall(true);  // 切屏 / 任务栏变化后球跟着走
         return 0;
     case WM_DESTROY:
-        if (!g_selftest) SaveNow();
+        if (!g_selftest) { SaveNow(); PersistNoteGeometry(); }  // 退出兜底保存几何
         CleanupAndQuit();
         PostQuitMessage(0);
         return 0;
@@ -890,9 +1001,15 @@ static bool CreateWindows() {
 
     RECT wa = WorkAreaFor(ActiveMonitor());
     int nw = S(kBaseNoteW), nh = S(kBaseNoteH), nm = S(kNoteMargin);
+    int nx = wa.right - nw - nm, ny = wa.top + nm;
+    RECT saved = {};
+    if (SavedNoteRect(saved)) {  // 有有效记忆就恢复大小与位置，否则默认右上角
+        nx = saved.left; ny = saved.top;
+        nw = saved.right - saved.left; nh = saved.bottom - saved.top;
+    }
     g_note = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kNoteClass, L"GSticky",
                              WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
-                             wa.right - nw - nm, wa.top + nm, nw, nh,
+                             nx, ny, nw, nh,
                              nullptr, nullptr, g_hinst, nullptr);
     if (!g_note) return false;
     SendMessageW(g_note, WM_SETICON, ICON_BIG, (LPARAM)g_iconBig);

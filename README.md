@@ -32,6 +32,7 @@ GSticky 的解法是**治本**——内部只用纯文本存储，从根上不�
 - 🔘 **悬浮球入口**：便签隐藏时，当前活动屏幕右上角浮现可拖动的圆形悬浮球；点击唤出（便签显示后球自动消失）。按屏幕记忆落点，不抢前台焦点。圆底取系统色，中心是品牌云标，与 exe / 托盘 / macOS 版同源 `icon.png`。
 - 📌 **常驻入口**：macOS 菜单栏图标（无 Dock 图标）；Windows 系统托盘图标。
 - 💾 **自动保存**：0.5s debounce 原子写入 `note.txt`，重启不丢。
+- 📐 **记住窗口大小与位置**：拖标题栏 / 拉边缘调整后自动保存，下次启动原样恢复；换分辨率或拔掉外接屏后会校验位置仍可见，失效则回退工作区右上角。
 - 🪶 **极致轻量**：原生实现，无 Electron、无第三方库、无运行时依赖。
 
 **平台差异（重要）**
@@ -44,6 +45,7 @@ GSticky 的解法是**治本**——内部只用纯文本存储，从根上不�
 | 全局热键授权 | 首次需在「系统设置 → 隐私与安全性 → 辅助功能」授权 | `RegisterHotKey` 免授权 |
 | 应用图标 | `icon.png` → `AppIcon.icns` / `menubar.png` | `icon.png` → `GSticky.ico`（9 尺寸）经 `windres` 嵌入 exe，窗口 / 任务栏 / 托盘 / 资源管理器同源 |
 | 开机自启 | 未提供（可用系统「登录项」自行配置） | 托盘「开机自启」勾选开关，写 `HKCU\...\Run`，**默认关闭** |
+| 窗口大小 / 位置记忆 | `UserDefaults` 的 `noteFrame_v1` | `%APPDATA%\GSticky\config.ini` 的 `[note] rect`（逻辑像素） |
 | 分发 | ad-hoc 签名 `.app` | 静态链接单 exe；未签名首次运行可能触发 SmartScreen |
 
 > **Windows 版明确不覆盖**：F11 / 独占全屏、PPT 放映、DXGI 全屏游戏、跨虚拟桌面跟随、提权窗口、DRM 覆盖层。这些不做设计、不做测试、不做承诺。根因是 Windows 的 `WS_EX_TOPMOST` 只是 z-order 层级带，不是 macOS 那种系统给辅助窗口的特权；日常最大化的应用窗口都是非 topmost，一次 `WS_EX_TOPMOST` 就足够，不需要定时器或重夺层级。
@@ -108,7 +110,7 @@ win\build.bat
 | 退出 | 菜单栏 →「退出 GSticky」 | 托盘 →「退出 GSticky」 |
 | 开机自启 | — | 托盘 →「开机自启」（勾选即开，默认关闭） |
 | 关闭便签 | — | 点红叉 = 隐藏（不退出），与 macOS 一致 |
-| 移动 / 缩放 | 拖标题栏 / 拉窗口边缘 | 同左（默认停靠工作区右上角） |
+| 移动 / 缩放 | 拖标题栏 / 拉边缘；大小与位置自动记忆，下次启动恢复 | 同左（默认停靠工作区右上角） |
 | 悬浮球 | 隐藏便签后出现；拖动调位置（按屏幕记忆），单击唤出 | 同左 |
 | 编辑 | 直接打字 | 直接打字 |
 | 标准编辑快捷键 | `⌘A / ⌘C / ⌘V / ⌘X / ⌘Z / ⌘Q` | `Ctrl+A / C / V / X / Z`（`Ctrl+A` 由代码补齐） |
@@ -128,12 +130,15 @@ UTF-8 明文、**无 BOM、LF 换行**，一份文件，随便备份 / 同步。
 
 Windows 版的开机自启开关不落文件：状态即上述注册表值（存在 = 开，不存在 = 关）。
 
+**窗口几何**：Windows 存在 `%APPDATA%\GSticky\config.ini` 的 `[note] rect`（`x,y,w,h`，逻辑像素；同文件 `[ball]` 段保存悬浮球落点），macOS 存在 `UserDefaults` 的 `noteFrame_v1`。首次启动或记录失效时用默认 320×260 + 工作区右上角。
+
 ## 自定义（可选）
 
 | 想改什么 | 改哪里 |
 | --- | --- |
 | macOS 窗口层级 / 热键按键 | `macos/main.swift` 顶部 `stickyWindowLevel`、`hotkeyKeyCode` |
 | Windows 唤出是否抢焦点 / 尺寸 / 保存 debounce | `win/main.cpp` 顶部 `kActivateOnShow`、`kBaseNoteW/H`、`kSaveDebounceMs` |
+| 便签默认尺寸 / 恢复时的合法范围 | `win/main.cpp` 顶部 `kBaseNoteW/H`、`kMinNoteW/H`、`kMaxNoteW/H`；`macos/main.swift` 的 `buildWindow` / `restoreNoteFrame` |
 | **应用图标（双平台）** | 替换项目根 `icon.png`（200×200 PNG，白底），macOS 重跑 `bash macos/build.sh`；Windows 跑 `win\make_icon.py` 后重跑 `win\build.bat` |
 
 macOS 版图标兼容旧命名 `logo200.png` / `logo.png`；两个平台都会把白底转成透明（macOS 由 `macos/tools/make_menubar_icon.swift` 处理，Windows 由 `win/make_icon.py` 用同一阈值处理），保证小尺寸下不出现白方块。
@@ -152,10 +157,11 @@ macOS 版图标兼容旧命名 `logo200.png` / `logo.png`；两个平台都会�
 ```bat
 dist\GSticky.exe --selftest
 python win/verify_exe.py
+python win/verify_exe.py --autostart --geometry
 python win/verify_icon.py
 ```
 
-`--selftest` 把结构化结果写到 `%APPDATA%\GSticky\selftest.json`（13 项布尔检查，含悬浮球图标来自资源、开机自启注册表往返；自启检查用专用测试键、测完即删，不碰真实设置，也不碰 `note.txt`）；`verify_exe.py` 做真实启动的端到端回归（输入 → 0.5s 自动保存 → 复制 → 显隐 → `PrintWindow` 抓悬浮球做像素断言 → 退出，会自动备份并原样还原 `note.txt`，并在系统临时目录输出 `gsticky_ball_preview.png` 供肉眼核对）；`verify_exe.py --autostart` 额外实测托盘开关写入 / 删除注册表并原样还原用户设置（因会短暂改写真实自启项，默认跳过）；`verify_icon.py` 校验 exe 内 9 帧图标资源与 256 大图标可加载。
+`--selftest` 把结构化结果写到 `%APPDATA%\GSticky\selftest.json`（14 项布尔检查，含悬浮球图标来自资源、开机自启注册表往返、便签几何往返；自启用专用测试键、几何用独立测试 ini，测完即删，不碰真实设置，也不碰 `note.txt`）；`verify_exe.py` 做真实启动的端到端回归（输入 → 0.5s 自动保存 → 复制 → 显隐 → `PrintWindow` 抓悬浮球做像素断言 → 退出，会自动备份并原样还原 `note.txt` 与 `config.ini`，并在系统临时目录输出 `gsticky_ball_preview.png` 供肉眼核对）；`--autostart` 额外实测托盘开关写入 / 删除注册表；`--geometry` 额外实测改窗口 → 退出 → 重启 → 大小与位置恢复。两个可选检查都会改写真实设置并在结束时原样还原，故默认跳过；`verify_icon.py` 校验 exe 内 9 帧图标资源与 256 大图标可加载。
 
 > 验证脚本请使用 `PATH` 中的系统 Python（`python` 命令），不要使用编辑器 / 工具自带的私有 Python 运行时。
 > 完整验证记录见 **`win/VERIFICATION.md`**（唯一权威验证文档）。

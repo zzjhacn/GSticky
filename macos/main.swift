@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var ballWindow: NSWindow!
+    private let noteFrameKey = "noteFrame_v1"
 
     // MARK: - 生命周期
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -36,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         saveNow()
+        persistNoteFrame()   // 退出兜底：确保最后一次拖动/缩放一定落盘
         return .terminateNow
     }
 
@@ -187,7 +189,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         window.contentView = scroll
 
-        positionTopRight()
+        if !restoreNoteFrame() {
+            positionTopRight()   // 首次启动 / 记录失效：默认停靠活动屏右上角
+        }
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -197,6 +201,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let x = screen.visibleFrame.maxX - f.width - 20
         let y = screen.visibleFrame.maxY - f.height - 20
         window.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    // MARK: - 便签窗口几何记忆（大小 + 位置）
+    // 不用 frameAutosaveName：红叉是「隐藏」而非关闭，窗口不会走 AppKit 的
+    // 自动保存路径；改为在移动 / 缩放结束与退出时显式写入 UserDefaults。
+    // 与悬浮球落点一致，用同一份 UserDefaults，坐标是 AppKit 全局点坐标系。
+    private func restoreNoteFrame() -> Bool {
+        guard let saved = UserDefaults.standard.string(forKey: noteFrameKey) else { return false }
+        let parts = saved.split(separator: ",").compactMap { Double($0) }
+        guard parts.count == 4 else { return false }
+        let f = NSRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+        guard f.width >= 120, f.height >= 90 else { return false }
+        // 拔掉外接屏 / 改分辨率后窗口可能整体落在屏幕外：要求与某块屏幕的
+        // 可见区域至少 1/4 面积交集才恢复，否则回退默认右上角。
+        let visible = NSScreen.screens.contains { screen in
+            let i = screen.visibleFrame.intersection(f)
+            return !i.isNull && i.width * i.height >= f.width * f.height * 0.25
+        }
+        guard visible else { return false }
+        window.setFrame(f, display: false)
+        return true
+    }
+
+    private func persistNoteFrame() {
+        guard let win = window else { return }
+        let f = win.frame
+        UserDefaults.standard.set("\(f.origin.x),\(f.origin.y),\(f.size.width),\(f.size.height)",
+                                  forKey: noteFrameKey)
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        persistNoteFrame()
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        persistNoteFrame()
     }
 
     // MARK: - 悬浮球（便签隐藏时出现的入口）

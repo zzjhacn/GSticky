@@ -10,10 +10,12 @@
         检查悬浮球互斥 / 不抢焦点 → 走托盘退出命令。
 副作用控制：
   * 便签与托盘图标会短暂出现约 3 秒，结束后自动退出；
-  * note.txt 先备份、验证后原样恢复（原本不存在则删除）；
+  * note.txt / config.ini 先备份、验证后原样恢复（原本不存在则删除）；
   * 剪贴板若含非文本格式则跳过复制检查，否则验证后恢复原文本；
   * 开机自启开关检查默认跳过；--autostart 会短暂改写用户真实的 Run 项，
     但无论成败都在 finally 中原样还原。
+  * 几何记忆检查默认跳过；--geometry 会重开两次 exe 并改写 config.ini / note.txt，
+    同样在 finally 中把两者原样还原（原本不存在则删除）。
 """
 import ctypes
 import json
@@ -32,6 +34,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "dist", "GSticky.exe")
 DATA = os.path.join(os.environ.get("APPDATA", ""), "GSticky")
 NOTE = os.path.join(DATA, "note.txt")
+CONFIG = os.path.join(DATA, "config.ini")
 NOTE_CLASS = "GStickyNoteWindow_v1"
 BALL_CLASS = "GStickyBallWindow_v1"
 
@@ -60,6 +63,9 @@ u32.SendMessageW.restype = ctypes.c_ssize_t
 u32.PostMessageW.argtypes = [w.HWND, w.UINT, WPARAM, LPARAM]
 u32.PostMessageW.restype = w.BOOL
 u32.SystemParametersInfoW.argtypes = [w.UINT, w.UINT, ctypes.POINTER(w.RECT), w.UINT]
+u32.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, w.UINT]
+u32.SetWindowPos.restype = w.BOOL
 u32.GetForegroundWindow.restype = w.HWND
 u32.OpenClipboard.argtypes = [w.HWND]
 u32.OpenClipboard.restype = w.BOOL
@@ -87,6 +93,9 @@ WM_GETTEXT = 0x000D
 WM_CHAR = 0x0102
 WM_COMMAND = 0x0111
 WM_HOTKEY = 0x0312
+WM_EXITSIZEMOVE = 0x0232
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
 ID_COPY_ALL = 4002
 ID_QUIT = 4003
 ID_AUTOSTART = 4004
@@ -188,7 +197,10 @@ def check_autostart(note):
         after = read_run_value()
 
         result["autostart_toggle_flips_state"] = (mid is None) != (before is None)
-        result["autostart_toggle_restores"] = (after == before)
+        # 只校验「开关状态」回到原点：重新写入时 exe 用当前进程的模块路径，
+        # 盘符大小写可能与原值不同（功能等价），不必要求字节级相等。
+        # 字节级原样还原由 finally 的 autostart_state_restored 负责。
+        result["autostart_toggle_restores"] = (after is None) == (before is None)
         # 两次快照里必有一个处于「开启」状态，用它核对命令格式与 exe 路径
         enabled = mid if mid is not None else after
         cmd = enabled[0] if enabled else ""
@@ -205,6 +217,110 @@ def check_autostart(note):
         except OSError as exc:
             result["autostart_restore_error"] = str(exc)
         result["autostart_state_restored"] = (read_run_value() == before)
+    return result
+
+
+# ---- 便签几何记忆（可选端到端检查） -----------------------------------------
+# 真实改窗口 → 触发 WM_EXITSIZEMOVE 保存 → 退出 → 重启 → 断言大小与位置恢复。
+# 会改写用户真实的 config.ini 与 note.txt，默认跳过；finally 中原样还原。
+def _ini_text(path):
+    raw = open(path, "rb").read()
+    # WritePrivateProfileStringW 新建文件时可能是 ANSI，也可能是 UTF-16 BOM
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    return raw.decode("latin-1", errors="replace")
+
+
+def _launch_app():
+    time.sleep(0.20)  # 等上一实例的窗口彻底销毁，避免 FindWindow 命中旧窗口
+    p = subprocess.Popen([EXE])
+    note = 0
+    for _ in range(60):
+        note = u32.FindWindowW(NOTE_CLASS, None)
+        if note:
+            break
+        time.sleep(0.05)
+    time.sleep(0.35)
+    return p, note
+
+
+def _quit_app(note, p):
+    u32.PostMessageW(note, WM_COMMAND, ID_QUIT, 0)
+    try:
+        return p.wait(timeout=6)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        return -1
+
+
+def check_geometry():
+    result = {}
+    cfg_backup = None
+    if os.path.exists(CONFIG):
+        with open(CONFIG, "rb") as f:
+            cfg_backup = f.read()
+    note_backup = None
+    if os.path.exists(NOTE):
+        with open(NOTE, "rb") as f:
+            note_backup = f.read()
+    p1 = p2 = None
+    try:
+        p1, note1 = _launch_app()
+        result["geometry_first_launch"] = bool(note1) and p1.poll() is None
+        if not note1:
+            return result
+        wa = w.RECT()
+        u32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(wa), 0)
+        nx, ny = wa.left + 300, wa.top + 240
+        nw, nh = 500, 380
+        u32.SetWindowPos(note1, None, nx, ny, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE)
+        time.sleep(0.25)
+        r1 = w.RECT()
+        u32.GetWindowRect(note1, ctypes.byref(r1))
+        result["geometry_applied"] = (
+            abs(r1.left - nx) <= 2 and abs(r1.top - ny) <= 2 and
+            abs((r1.right - r1.left) - nw) <= 2 and
+            abs((r1.bottom - r1.top) - nh) <= 2)
+        u32.PostMessageW(note1, WM_EXITSIZEMOVE, 0, 0)
+        time.sleep(0.30)
+        txt = _ini_text(CONFIG) if os.path.exists(CONFIG) else ""
+        result["geometry_config_written"] = "[note]" in txt and "rect=" in txt
+        rc1 = _quit_app(note1, p1)
+        p1 = None
+        result["geometry_first_exit"] = (rc1 == 0)
+
+        p2, note2 = _launch_app()
+        result["geometry_second_launch"] = bool(note2) and p2.poll() is None
+        if note2:
+            r2 = w.RECT()
+            u32.GetWindowRect(note2, ctypes.byref(r2))
+            result["geometry_restored_rect"] = [r2.left, r2.top, r2.right, r2.bottom]
+            # 容差覆盖 DPI 逻辑像素往返的 ±1 与 DWM 不可见边框
+            result["geometry_restored_position"] = (
+                abs(r2.left - nx) <= 12 and abs(r2.top - ny) <= 12)
+            result["geometry_restored_size"] = (
+                abs((r2.right - r2.left) - nw) <= 12 and
+                abs((r2.bottom - r2.top) - nh) <= 12)
+            rc2 = _quit_app(note2, p2)
+            p2 = None
+            result["geometry_second_exit"] = (rc2 == 0)
+    finally:
+        for p in (p1, p2):
+            if p is not None and p.poll() is None:
+                p.kill()
+        for path, backup in ((CONFIG, cfg_backup), (NOTE, note_backup)):
+            if backup is not None:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(backup)
+            else:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        result["geometry_config_restored"] = (
+            (not os.path.exists(CONFIG)) if cfg_backup is None
+            else (os.path.exists(CONFIG) and open(CONFIG, "rb").read() == cfg_backup))
     return result
 
 
@@ -378,6 +494,10 @@ def main():
     if existed:
         with open(NOTE, "rb") as f:
             original = f.read()
+    config_original = None
+    if os.path.exists(CONFIG):
+        with open(CONFIG, "rb") as f:
+            config_original = f.read()
     proc = None
     try:
         proc = subprocess.Popen([EXE])
@@ -526,6 +646,23 @@ def main():
                 os.remove(NOTE)
             except OSError:
                 pass
+        # 还原窗口几何配置：exe 在 WM_DESTROY 时会自动写 [note]，
+        # 任何一次验证启动都不能改动用户真实 config.ini
+        if config_original is not None:
+            os.makedirs(DATA, exist_ok=True)
+            with open(CONFIG, "wb") as f:
+                f.write(config_original)
+        else:
+            try:
+                os.remove(CONFIG)
+            except OSError:
+                pass
+
+    # 几何记忆：默认跳过（会重启 exe 并改写用户配置），--geometry 时实证
+    if "--geometry" in sys.argv:
+        checks.update(check_geometry())
+    else:
+        checks["geometry_check"] = "skipped: 会重启 exe 并改写用户配置（--geometry 可强制）"
 
     required = [
         "process_started", "note_visible", "note_topmost", "note_inside_work_area",
@@ -542,6 +679,12 @@ def main():
         required += ["autostart_toggle_flips_state", "autostart_toggle_restores",
                      "autostart_command_quoted", "autostart_command_matches_exe",
                      "autostart_state_restored"]
+    if checks.get("geometry_first_launch") is not None:
+        required += ["geometry_first_launch", "geometry_applied",
+                     "geometry_config_written", "geometry_first_exit",
+                     "geometry_second_launch", "geometry_restored_position",
+                     "geometry_restored_size", "geometry_second_exit",
+                     "geometry_config_restored"]
     ok = all(checks.get(k) is True for k in required)
     out = {"ok": ok, "exe": EXE, "checks": checks}
     print(json.dumps(out, ensure_ascii=False, indent=2))

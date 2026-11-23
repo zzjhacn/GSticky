@@ -646,6 +646,21 @@ static void ShowTrayMenu() {
     DestroyMenu(menu);
 }
 
+// 悬浮球右键菜单：只有区域截图。球是 WS_EX_NOACTIVATE 当不了菜单属主，
+// 借隐藏的便签做属主（与托盘菜单同一套路）；命令仍走 kIdScreenshot →
+// kMsgShotStart 延迟启动，保证 TrackPopupMenu 返回、菜单销毁后才抓屏。
+static void ShowBallMenu() {
+    POINT pt = {};
+    GetCursorPos(&pt);
+    if (!gsticky_shot::IsActive()) g_fgBeforeMenu = GetForegroundWindow();
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"区域截图（可标注）");
+    SetForegroundWindow(g_note);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, pt.x, pt.y, 0, g_note, nullptr);
+    PostMessageW(g_note, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+}
+
 static void ForceForeground(HWND h) {
     if (SetForegroundWindow(h)) return;
     HWND fg = GetForegroundWindow();
@@ -1037,6 +1052,9 @@ static LRESULT CALLBACK BallProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_ballMoved) PersistBallPos();
             else SetNoteVisible(true, kActivateOnShow);  // 点击唤出
         }
+        return 0;
+    case WM_RBUTTONUP:
+        ShowBallMenu();
         return 0;
     case WM_DESTROY:
         return 0;

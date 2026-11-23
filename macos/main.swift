@@ -284,6 +284,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let ballView = BallView()
         ballView.onTap = { [weak self] in self?.setNoteVisible(true) }
         ballView.onDragEnd = { [weak self] in self?.persistBallPosition() }
+        // 右键菜单：NSView 默认 rightMouseDown 会弹出 view.menu，无需重写事件
+        let ballMenu = NSMenu()
+        let shot = NSMenuItem(title: "区域截图（可标注）", action: #selector(startScreenshot), keyEquivalent: "")
+        shot.target = self
+        ballMenu.addItem(shot)
+        ballView.menu = ballMenu
         ballWindow.contentView = ballView
 
         // 启动时不显示球（便签默认可见），仅当便签被隐藏后才出现

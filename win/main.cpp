@@ -35,6 +35,8 @@
 #include <cwchar>
 #include <string>
 
+#include "screenshot.h"
+
 #ifndef MOD_NOREPEAT
 #define MOD_NOREPEAT 0x4000
 #endif
@@ -65,8 +67,11 @@ static const UINT kTimerSelftest = 3;
 static const UINT kTimerFlash = 4;
 static const UINT kMsgTray = WM_APP + 1;
 static const UINT kMsgActivate = WM_APP + 2;
+// kMsgShotDone = WM_APP + 3 定义在 screenshot.h；菜单关闭后再启动，避免把托盘菜单截进图里
+static const UINT kMsgShotStart = WM_APP + 4;
 static const UINT kIdShow = 4001, kIdCopyAll = 4002, kIdQuit = 4003;
 static const UINT kIdAutoStart = 4004;
+static const UINT kIdScreenshot = 4005;
 static const int  kIconId = 101;  // 必须与 win/GSticky.rc 的 IDI_GSTICKY 一致
 
 // 开机自启：HKCU Run 项是唯一状态源（不另写配置文件），无需管理员权限。
@@ -100,6 +105,11 @@ static std::wstring g_selftestNotePath, g_selftestOutPath;
 
 static bool g_ballDragging = false, g_ballMoved = false;
 static POINT g_ballDragStart = {}, g_ballOriginStart = {};
+
+// 截图会话：记录截屏前的前台窗口与自家浮层可见性，结束后精确还原。
+// 不使用 SetNoteVisible()，它会额外触发保存/悬浮球重定位，改变用户状态。
+static HWND g_fgBeforeMenu = nullptr;
+static bool g_shotNoteVisible = false, g_shotBallVisible = false;
 
 static LRESULT CALLBACK NoteProc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK BallProc(HWND, UINT, WPARAM, LPARAM);
@@ -616,9 +626,14 @@ static void RestoreTrayTip() {
 static void ShowTrayMenu() {
     POINT pt = {};
     GetCursorPos(&pt);
+    // 托盘菜单会先把 g_note 提到前台，这里提前记录用户真正正在用的窗口，
+    // 截图会话结束后还给它，避免把便签变成前台窗口。
+    // 会话进行中不要用覆盖层窗口覆盖「截屏前的前台窗口」记录
+    if (!gsticky_shot::IsActive()) g_fgBeforeMenu = GetForegroundWindow();
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (g_noteVisible ? MF_CHECKED : 0), kIdShow,
                 L"显示 / 隐藏便签  (Ctrl+Alt+G)");
+    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"区域截图（可标注）");
     AppendMenuW(menu, MF_STRING, kIdCopyAll, L"复制全部（纯文本）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (AutoStartEnabled() ? MF_CHECKED : 0), kIdAutoStart,
@@ -667,7 +682,41 @@ static void SetNoteVisible(bool show, bool activate) {
     }
 }
 
-static void ToggleNote() { SetNoteVisible(!g_noteVisible, kActivateOnShow); }
+// 截图会话期间挂起显隐：覆盖层/编辑器已显示，浮层重新冒出来会挡住圈选。
+// 热键、托盘单击、托盘「显示/隐藏」三条路径都经过这里，一处挡住即可。
+static void ToggleNote() {
+    if (gsticky_shot::IsActive()) return;
+    SetNoteVisible(!g_noteVisible, kActivateOnShow);
+}
+
+// ---- 区域截图会话 ---------------------------------------------------------
+// 捕获瞬间隐藏自家便签/悬浮球（P0 实测：分层窗口同样会被 BitBlt 抓进图里），
+// 会话结束后按进入前的状态精确还原，并把前台还给截屏前正在用的窗口。
+static void RestoreOverlaysAfterShot(const wchar_t* tip) {
+    if (g_shotNoteVisible) {
+        ShowWindow(g_note, SW_SHOWNOACTIVATE);
+        SetWindowPos(g_note, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    if (g_shotBallVisible) ShowWindow(g_ball, SW_SHOWNOACTIVATE);
+    HWND fg = g_fgBeforeMenu;
+    g_fgBeforeMenu = nullptr;
+    if (fg && IsWindow(fg) && fg != g_note && fg != g_ball)
+        SetForegroundWindow(fg);
+    if (tip) FlashTrayTip(tip);
+}
+
+static void StartScreenshot() {
+    if (gsticky_shot::IsActive()) return;
+    g_shotNoteVisible = IsWindowVisible(g_note) != FALSE;
+    g_shotBallVisible = IsWindowVisible(g_ball) != FALSE;
+    ShowWindow(g_note, SW_HIDE);
+    ShowWindow(g_ball, SW_HIDE);
+    if (!gsticky_shot::Start(g_hinst, g_note)) {
+        gsticky_shot::Cancel();
+        RestoreOverlaysAfterShot(L"截图启动失败");
+    }
+}
 
 // ---- 自检（--selftest）----------------------------------------------------
 static HWND g_zNote = nullptr, g_zTest = nullptr;
@@ -757,9 +806,14 @@ static void RunSelfTest() {
     bool geoGone = GetFileAttributesW(testIni.c_str()) == INVALID_FILE_ATTRIBUTES;
     bool geometryRoundtrip = geoWrite && geoEqual && geoCleanup && geoGone;
 
+    // 6) 截图子系统：只在内存里做 32bpp top-down DIB 往返与覆盖层压暗验证，
+    //    不建窗口、不抓屏、不碰用户剪贴板。
+    bool shotDib = gsticky_shot::SelfTestDib();
+    bool shotDim = gsticky_shot::SelfTestDim();
+
     bool allOk = topmost && toolwindow && inside && above && editOk && g_hotkeyOk &&
                  g_trayOk && g_ball && noActivate && utf8Ok && iconOk && ballIconOk &&
-                 autostartRoundtrip && geometryRoundtrip;
+                 autostartRoundtrip && geometryRoundtrip && shotDib && shotDim;
     std::string j = "{\n";
     j += "  \"ok\": " + std::string(allOk ? "true" : "false") + ",\n";
     j += "  \"mode\": \"selftest\",\n";
@@ -782,6 +836,8 @@ static void RunSelfTest() {
     JBool(j, "icon_from_resource", iconOk);
     JBool(j, "autostart_registry_roundtrip", autostartRoundtrip);
     JBool(j, "note_geometry_roundtrip", geometryRoundtrip);
+    JBool(j, "shot_dib_roundtrip", shotDib);
+    JBool(j, "shot_dim_not_black", shotDim);
     JBool(j, "autostart_enabled", autostartEnabled, true);
     j += "}\n";
     WriteRawFile(g_selftestOutPath, j);
@@ -789,6 +845,7 @@ static void RunSelfTest() {
 
 // ---- 窗口过程 -------------------------------------------------------------
 static void CleanupAndQuit() {
+    gsticky_shot::Cancel();   // 退出时若截图会话仍在进行，先收尾（不写剪贴板）
     KillTimer(g_note, kTimerSave);
     KillTimer(g_note, kTimerFlash);
     UnregisterHotKey(g_note, kHotkeyId);
@@ -812,6 +869,10 @@ static LRESULT CALLBACK NoteProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         switch (id) {
         case kIdShow:     ToggleNote(); break;
+        case kIdScreenshot:
+            // 延迟到 TrackPopupMenu 返回、菜单销毁之后再启动，否则会把托盘菜单截进图里
+            PostMessageW(hwnd, kMsgShotStart, 0, 0);
+            break;
         case kIdCopyAll:  FlashTrayTip(CopyAll() ? L"已复制全部（纯文本）" : L"复制失败"); break;
         case kIdAutoStart: {
             bool want = !AutoStartEnabled();  // 每次现读注册表，菜单不会记旧状态
@@ -852,7 +913,13 @@ static LRESULT CALLBACK NoteProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case kMsgActivate:
-        SetNoteVisible(true, kActivateOnShow);
+        if (!gsticky_shot::IsActive()) SetNoteVisible(true, kActivateOnShow);
+        return 0;
+    case kMsgShotStart:
+        StartScreenshot();
+        return 0;
+    case gsticky_shot::kMsgShotDone:
+        RestoreOverlaysAfterShot(wp ? L"截图已复制到剪贴板" : L"已取消截图");
         return 0;
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)wp;

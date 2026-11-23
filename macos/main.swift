@@ -112,14 +112,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         let menu = NSMenu()
         let toggle = NSMenuItem(title: "显示 / 隐藏便签", action: #selector(toggleWindow), keyEquivalent: "")
+        let shot = NSMenuItem(title: "区域截图（可标注）", action: #selector(startScreenshot), keyEquivalent: "")
+        shot.target = self
         let copyAll = NSMenuItem(title: "复制全部（纯文本）", action: #selector(copyAll), keyEquivalent: "")
         let quit = NSMenuItem(title: "退出 GSticky", action: #selector(quit), keyEquivalent: "q")
-        menu.items = [toggle, copyAll, .separator(), quit]
+        menu.items = [toggle, shot, copyAll, .separator(), quit]
         statusItem.menu = menu
     }
 
     @objc private func toggleWindow() {
+        if ScreenshotController.shared.isActive { return }  // 截图会话期间不弹出浮层
         setNoteVisible(!window.isVisible)
+    }
+
+    // 区域截图：会话期间隐藏自家便签 / 悬浮球，结束后按原状态精确还原。
+    // 圈选由系统 screencapture 完成，标注与 PNG 输出在 Screenshot.swift。
+    @objc private func startScreenshot() {
+        // 防重入：控制器在会话中会静默拒绝二次 start，若此处仍先隐藏浮层，
+        // 便签/悬浮球就会永远消失且收不到 restore 回调。
+        if ScreenshotController.shared.isActive { return }
+        let noteWasVisible = window.isVisible
+        let ballWasVisible = ballWindow.isVisible
+        window.orderOut(nil)
+        ballWindow.orderOut(nil)
+        ScreenshotController.shared.start(noteWasVisible: noteWasVisible,
+                                          ballWasVisible: ballWasVisible) {
+            [weak self] noteVisible, ballVisible, copied in
+            guard let self else { return }
+            if noteVisible { self.window.orderFront(nil) }
+            if ballVisible { self.ballWindow.orderFront(nil) }
+            self.flashStatus(title: copied ? "✅ 截图已复制" : "截图已取消")
+        }
     }
 
     // 统一的显隐状态机：便签与悬浮球互斥（显示其一即隐藏另一）

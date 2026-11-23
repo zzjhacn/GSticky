@@ -28,7 +28,7 @@ done
 echo "==> [1/4] 用 swiftc 编译（AppKit，原生）"
 mkdir -p "$DIST" "$WORK"   # 首次构建时产物目录尚不存在，swiftc 不会自动创建输出目录
 swiftc -O -framework Cocoa -target arm64-apple-macosx13.0 \
-    "$SRC" -o "$WORK/$APP_NAME"
+    "$SRC" "$SCRIPT_DIR/Screenshot.swift" -o "$WORK/$APP_NAME"
 
 echo "==> [2/4] 组装 .app 包"
 rm -rf "$APP"

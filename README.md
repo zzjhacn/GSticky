@@ -9,9 +9,9 @@ GSticky 是原生开发的双平台便签：macOS 版用 Swift / AppKit，Window
 | 路径 | 内容 |
 | --- | --- |
 | `icon.png` | **双平台唯一图标源**（200×200 PNG，白底） |
-| `macos/` | macOS 版源码 `main.swift` + 构建脚本 `build.sh` |
+| `macos/` | macOS 版源码 `main.swift` + `Screenshot.swift`（区域截图）、构建脚本 `build.sh` |
 | `macos/tools/` | macOS 菜单栏图标处理工具 `make_menubar_icon.swift` |
-| `win/` | Windows 版源码 `main.cpp`、`build.bat`、图标资源 `GSticky.ico` / `.rc`、图标生成与验证脚本、验证记录 `VERIFICATION.md` |
+| `win/` | Windows 版源码 `main.cpp`、`screenshot.h` / `screenshot.cpp`（区域截图）、`build.bat`、图标资源 `GSticky.ico` / `.rc`、图标生成与验证脚本、验证记录 `VERIFICATION.md` |
 | `dist/` | 双平台构建产物 `GSticky.app` / `GSticky.exe`；本地生成，不随仓库提交 |
 
 ## 为什么有 GSticky
@@ -33,6 +33,7 @@ GSticky 的解法是**治本**——内部只用纯文本存储，从根上不�
 - 📌 **常驻入口**：macOS 菜单栏图标（无 Dock 图标）；Windows 系统托盘图标。
 - 💾 **自动保存**：0.5s debounce 原子写入 `note.txt`，重启不丢。
 - 📐 **记住窗口大小与位置**：拖标题栏 / 拉边缘调整后自动保存，下次启动原样恢复；换分辨率或拔掉外接屏后会校验位置仍可见，失效则回退工作区右上角。
+- 🖼️ **区域截图（可标注）**：菜单栏 / 托盘一键进入 → 鼠标圈选 → 加文字、画框、箭头，支持单步撤销 → 结果写入剪贴板，可直接粘贴。截图瞬间自动隐藏自家便签与悬浮球，结束后原样恢复，不新增热键。
 - 🪶 **极致轻量**：原生实现，无 Electron、无第三方库、无运行时依赖。
 
 **平台差异（重要）**
@@ -46,6 +47,8 @@ GSticky 的解法是**治本**——内部只用纯文本存储，从根上不�
 | 应用图标 | `icon.png` → `AppIcon.icns` / `menubar.png` | `icon.png` → `GSticky.ico`（9 尺寸）经 `windres` 嵌入 exe，窗口 / 任务栏 / 托盘 / 资源管理器同源 |
 | 开机自启 | 未提供（可用系统「登录项」自行配置） | 托盘「开机自启」勾选开关，写 `HKCU\...\Run`，**默认关闭** |
 | 窗口大小 / 位置记忆 | `UserDefaults` 的 `noteFrame_v1` | `%APPDATA%\GSticky\config.ini` 的 `[note] rect`（逻辑像素） |
+| 区域截图取图 | 委托系统 `screencapture -i`，用**系统原生圈选 UI** | `BitBlt` 预抓整个虚拟屏 + 自绘冻结覆盖层圈选 |
+| 截图输出 | `NSPasteboard` 的 PNG | `CF_DIB`（32bpp top-down，保留字节置不透明） |
 | 分发 | ad-hoc 签名 `.app` | 静态链接单 exe；未签名首次运行可能触发 SmartScreen |
 
 > **Windows 版明确不覆盖**：F11 / 独占全屏、PPT 放映、DXGI 全屏游戏、跨虚拟桌面跟随、提权窗口、DRM 覆盖层。这些不做设计、不做测试、不做承诺。根因是 Windows 的 `WS_EX_TOPMOST` 只是 z-order 层级带，不是 macOS 那种系统给辅助窗口的特权；日常最大化的应用窗口都是非 topmost，一次 `WS_EX_TOPMOST` 就足够，不需要定时器或重夺层级。
@@ -59,6 +62,8 @@ GSticky 的解法是**治本**——内部只用纯文本存储，从根上不�
 **GSticky 做法**：热键唤起浮层 → 敲两行 → 再按一次隐去。全程不离开当前窗口。
 
 > 更省事的是**悬浮球**：便签隐藏后屏幕右上角会冒出一个小圆球，鼠标点一下就回来，纯鼠标也能随时呼出便签。
+
+> **区域截图操作**：入口 → 拖动鼠标圈选（Esc 取消、选区过小可重选）→ 编辑器里点工具条或按 `1 / 2 / 3` 切换文字 / 画框 / 箭头，`Z`（或 `Ctrl+Z` / `⌘Z`）撤销一步，`Enter` 或「完成」写入剪贴板。文字工具会就地弹出输入框，回车提交。全程不注册新热键，不打断原有 `Ctrl+Alt+G` / `Ctrl+Option+G`。
 
 这就是它存在的意义：**干活时当一块「临时草稿纸」，用完即隐，绝不抢戏。**
 
@@ -107,6 +112,7 @@ win\build.bat
 | --- | --- | --- |
 | 显示 / 隐藏便签 | 菜单栏 →「显示 / 隐藏」，或 `Ctrl + Option + G` | 托盘 →「显示 / 隐藏」，或 `Ctrl + Alt + G`，或点悬浮球 |
 | 复制全部（纯文本） | 菜单栏 →「复制全部（纯文本）」 | 托盘 →「复制全部（纯文本）」 |
+| 区域截图 | 菜单栏 →「区域截图（可标注）」 | 托盘 →「区域截图（可标注）」 |
 | 退出 | 菜单栏 →「退出 GSticky」 | 托盘 →「退出 GSticky」 |
 | 开机自启 | — | 托盘 →「开机自启」（勾选即开，默认关闭） |
 | 关闭便签 | — | 点红叉 = 隐藏（不退出），与 macOS 一致 |
@@ -116,6 +122,8 @@ win\build.bat
 | 标准编辑快捷键 | `⌘A / ⌘C / ⌘V / ⌘X / ⌘Z / ⌘Q` | `Ctrl+A / C / V / X / Z`（`Ctrl+A` 由代码补齐） |
 
 > **开机自启（仅 Windows）**：托盘菜单 →「开机自启」，勾选即开、取消即关，**默认关闭**。开关状态就是注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `GSticky` 值（数据为带引号的 exe 绝对路径），不需要管理员权限，也不产生额外配置文件。移动或改名 exe 后，下次启动会把注册表中的旧路径自动刷新为当前路径。直接删除 exe 前请先关掉开关，以免登录时残留一个指向失效路径的启动项。
+
+> **区域截图不覆盖**：Windows 侧 GPU 合成窗口、受保护视频帧、DRM 内容、独占全屏可能抓成黑块（GDI `GetDC(NULL)+BitBlt` 只取合成后的桌面像素，读不到受保护表面）；macOS 侧若系统把「屏幕录制」权限归属到本 App，首次需在「系统设置 → 隐私与安全性 → 屏幕录制」授权并重启。两版都不做滚动截图、窗口识别、自由画笔、马赛克、颜色板、桌面文件保存；输出只有剪贴板。
 
 > 提示：在**目标 App** 里粘贴时若变样，那是目标 App 的行为；可改用「粘贴并匹配样式」，或先过一遍 GSticky 再粘——纯文本怎么会丢格式呢。
 
@@ -161,7 +169,7 @@ python win/verify_exe.py --autostart --geometry
 python win/verify_icon.py
 ```
 
-`--selftest` 把结构化结果写到 `%APPDATA%\GSticky\selftest.json`（14 项布尔检查，含悬浮球图标来自资源、开机自启注册表往返、便签几何往返；自启用专用测试键、几何用独立测试 ini，测完即删，不碰真实设置，也不碰 `note.txt`）；`verify_exe.py` 做真实启动的端到端回归（输入 → 0.5s 自动保存 → 复制 → 显隐 → `PrintWindow` 抓悬浮球做像素断言 → 退出，会自动备份并原样还原 `note.txt` 与 `config.ini`，并在系统临时目录输出 `gsticky_ball_preview.png` 供肉眼核对）；`--autostart` 额外实测托盘开关写入 / 删除注册表；`--geometry` 额外实测改窗口 → 退出 → 重启 → 大小与位置恢复。两个可选检查都会改写真实设置并在结束时原样还原，故默认跳过；`verify_icon.py` 校验 exe 内 9 帧图标资源与 256 大图标可加载。
+`--selftest` 把结构化结果写到 `%APPDATA%\GSticky\selftest.json`（16 项核心布尔检查，含悬浮球图标来自资源、开机自启注册表往返、便签几何往返、截图 DIB 内存往返、覆盖层压暗非全黑；自启用专用测试键、几何用独立测试 ini，测完即删，不碰真实设置，也不碰 `note.txt`）；`verify_exe.py` 做真实启动的端到端回归（输入 → 0.5s 自动保存 → 复制 → 显隐 → `PrintWindow` 抓悬浮球做像素断言 → 退出，会自动备份并原样还原 `note.txt` 与 `config.ini`，并在系统临时目录输出 `gsticky_ball_preview.png` 供肉眼核对）；`--autostart` 额外实测托盘开关写入 / 删除注册表；`--geometry` 额外实测改窗口 → 退出 → 重启 → 大小与位置恢复。两个可选检查都会改写真实设置并在结束时原样还原，故默认跳过；`verify_icon.py` 校验 exe 内 9 帧图标资源与 256 大图标可加载。
 
 > 验证脚本请使用 `PATH` 中的系统 Python（`python` 命令），不要使用编辑器 / 工具自带的私有 Python 运行时。
 > 完整验证记录见 **`win/VERIFICATION.md`**（唯一权威验证文档）。

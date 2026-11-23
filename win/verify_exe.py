@@ -482,6 +482,26 @@ def ball_visual_checks(ball, out_png):
     }
 
 
+def check_screenshot_build(exe_path=None):
+    """只读 exe 字节，确认截图子系统确实被链接进产物。
+
+    区域截图的圈选/标注必须人工交互，自动化会抢占全屏、隐藏浮层并改写
+    剪贴板，与「不污染用户数据」约定冲突，所以只做构建完整性检查：
+    不启动 exe、不建窗口、不碰便签/配置/剪贴板。
+    """
+    path = exe_path or EXE
+    with open(path, "rb") as f:
+        blob = f.read()
+    needles = {
+        "shot_overlay_class": "GStickyShotOverlay_v1",
+        "shot_editor_class": "GStickyShotEditor_v1",
+        "shot_menu_entry": "区域截图（可标注）",
+    }
+    out = {key: (text.encode("utf-16-le") in blob) for key, text in needles.items()}
+    out["shot_build_present"] = all(out.values())
+    return out
+
+
 def main():
     if not os.path.exists(EXE):
         print(json.dumps({"ok": False, "error": "dist/GSticky.exe 不存在，请先构建"},
@@ -489,6 +509,7 @@ def main():
         return 1
 
     checks = {}
+    checks.update(check_screenshot_build())
     existed = os.path.exists(NOTE)
     original = None
     if existed:
@@ -672,6 +693,7 @@ def main():
         "ball_noactivate", "ball_capture_valid", "ball_uses_brand_logo",
         "ball_no_legacy_yellow", "ball_no_legacy_square", "foreground_not_stolen_by_ball",
         "shown_by_hotkey", "ball_hidden_when_shown", "clean_exit",
+        "shot_build_present",
     ]
     if checks.get("copy_all_plain_text") is not None:
         required += ["copy_all_plain_text", "copy_all_no_extra_format"]

@@ -25,6 +25,7 @@ if errorlevel 1 (
 )
 
 set "SRC=%~dp0main.cpp"
+set "SRC2=%~dp0screenshot.cpp"
 set "RES=%~dp0GSticky_res.o"
 set "DIST=%~dp0..\dist"
 set "OUT=%DIST%\GSticky.exe"
@@ -37,7 +38,7 @@ if errorlevel 1 (popd & echo [GSticky] ICON RESOURCE FAILED & exit /b 1)
 popd
 
 echo [GSticky] compiler: %GXX%
-"%GXX%" -std=c++17 -O2 -s -mwindows -static -Wall -Wextra -Wno-unused-parameter "%SRC%" "%RES%" -o "%OUT%" -luser32 -lgdi32 -lshell32 -ladvapi32
+"%GXX%" -std=c++17 -O2 -s -mwindows -static -Wall -Wextra -Wno-unused-parameter "%SRC%" "%SRC2%" "%RES%" -o "%OUT%" -luser32 -lgdi32 -lshell32 -ladvapi32
 if errorlevel 1 (echo [GSticky] BUILD FAILED & exit /b 1)
 
 echo [GSticky] BUILD OK: %OUT%

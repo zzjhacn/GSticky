@@ -382,6 +382,14 @@ final class ScreenshotController: NSObject {
         win.makeFirstResponder(view)
     }
 
+    /// 外部取消入口（⌘W 等）：统一走 finish，保证 restore 回调恰好一次。
+    /// 圈选阶段终止 screencapture；其 terminationHandler 再进 finish 时
+    /// restore 已置 nil，天然幂等。
+    func cancel() {
+        guard isActive else { return }
+        finish(copied: false)
+    }
+
     private func finish(copied: Bool) {
         isActive = false
         if let win = editor {

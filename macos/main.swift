@@ -69,6 +69,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
+        // 文件菜单：⌘W 关闭。不用 performClose:——会话期间 key window 是
+        // 标注编辑器，performClose 会绕过 finish() 直接关窗，isActive 卡死。
+        let fileMenuItem = NSMenuItem()
+        let fileMenu = NSMenu(title: "文件")
+        let closeItem = NSMenuItem(title: "关闭", action: #selector(closeKeyWindow(_:)),
+                                   keyEquivalent: "w")
+        closeItem.target = self
+        fileMenu.addItem(closeItem)
+        fileMenuItem.submenu = fileMenu
+        mainMenu.addItem(fileMenuItem)
+
         // 编辑菜单：⌘Z / ⇧⌘Z / ⌘X / ⌘C / ⌘V / ⌘A
         let editMenuItem = NSMenuItem()
         let editMenu = NSMenu(title: "编辑")
@@ -174,6 +185,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         setNoteVisible(false)
         return false
+    }
+
+    // ⌘W：截图会话中取消会话（恢复截图前浮层状态）；否则隐藏便签 + 显示悬浮球
+    @objc private func closeKeyWindow(_ sender: Any?) {
+        if ScreenshotController.shared.isActive {
+            ScreenshotController.shared.cancel()
+            return
+        }
+        if window.isVisible { setNoteVisible(false) }
     }
 
     @objc private func copyAll() {

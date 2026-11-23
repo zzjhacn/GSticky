@@ -464,6 +464,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { EndSession(false); return 0; }
         return 0;
+    case WM_CLOSE:
+        // Alt+F4 / SC_CLOSE 必须走 EndSession：DefWindowProc 会直接销毁窗口，
+        // active 永久置位，便签/悬浮球不还原、显隐热键被挡死。
+        EndSession(false);
+        return 0;
     case WM_DESTROY:
         return 0;
     }
@@ -557,6 +562,9 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DestroyTextEdit(true);
             return 0;
         }
+        return 0;
+    case WM_CLOSE:
+        EndSession(false);   // 同 OverlayProc：Alt+F4 取消会话而非裸销毁
         return 0;
     case WM_DESTROY:
         return 0;

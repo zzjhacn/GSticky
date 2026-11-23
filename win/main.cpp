@@ -62,6 +62,7 @@ static const wchar_t* kBallClass = L"GStickyBallWindow_v1";
 static const wchar_t* kMutexName = L"Local\\GSticky_SingleInstance_v1";
 
 static const UINT kHotkeyId = 1;
+static const UINT kHotkeyShotId = 5;  // 区域截图 Ctrl+Shift+A
 static const UINT kTimerSave = 2;
 static const UINT kTimerSelftest = 3;
 static const UINT kTimerFlash = 4;
@@ -95,7 +96,7 @@ static HBRUSH g_editBrush = nullptr;
 static HICON g_iconBig = nullptr, g_iconSmall = nullptr, g_iconBall = nullptr;
 static bool g_iconsFromResource = false;  // false 时使用系统共享图标，不能 DestroyIcon
 static NOTIFYICONDATAW g_nid = {};
-static bool g_trayOk = false, g_hotkeyOk = false;
+static bool g_trayOk = false, g_hotkeyOk = false, g_hotkeyShotOk = false;
 static bool g_noteVisible = true, g_loading = false, g_selftest = false;
 static UINT g_dpi = 96;
 static double g_scale = 1.0;
@@ -110,6 +111,8 @@ static POINT g_ballDragStart = {}, g_ballOriginStart = {};
 // 不使用 SetNoteVisible()，它会额外触发保存/悬浮球重定位，改变用户状态。
 static HWND g_fgBeforeMenu = nullptr;
 static bool g_shotNoteVisible = false, g_shotBallVisible = false;
+// 本次截图会话开始时热键是否仍被其他程序占用（系统 API 查不到占用进程）
+static bool g_shotHotkeyConflict = false;
 
 static LRESULT CALLBACK NoteProc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK BallProc(HWND, UINT, WPARAM, LPARAM);
@@ -633,7 +636,7 @@ static void ShowTrayMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (g_noteVisible ? MF_CHECKED : 0), kIdShow,
                 L"显示 / 隐藏便签  (Ctrl+Alt+G)");
-    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"区域截图（可标注）");
+    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"区域截图（可标注）  (Ctrl+Shift+A)");
     AppendMenuW(menu, MF_STRING, kIdCopyAll, L"复制全部（纯文本）");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (AutoStartEnabled() ? MF_CHECKED : 0), kIdAutoStart,
@@ -654,7 +657,7 @@ static void ShowBallMenu() {
     GetCursorPos(&pt);
     if (!gsticky_shot::IsActive()) g_fgBeforeMenu = GetForegroundWindow();
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"区域截图（可标注）");
+    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"区域截图（可标注）  (Ctrl+Shift+A)");
     SetForegroundWindow(g_note);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, pt.x, pt.y, 0, g_note, nullptr);
     PostMessageW(g_note, WM_NULL, 0, 0);
@@ -718,11 +721,27 @@ static void RestoreOverlaysAfterShot(const wchar_t* tip) {
     g_fgBeforeMenu = nullptr;
     if (fg && IsWindow(fg) && fg != g_note && fg != g_ball)
         SetForegroundWindow(fg);
-    if (tip) FlashTrayTip(tip);
+    if (tip) {
+        if (g_shotHotkeyConflict) {
+            std::wstring t = std::wstring(tip) + L"（截图热键 Ctrl+Shift+A 被其他程序占用）";
+            FlashTrayTip(t.c_str());
+        } else {
+            FlashTrayTip(tip);
+        }
+    }
+}
+
+static bool RegisterShotHotkey() {
+    return RegisterHotKey(g_note, kHotkeyShotId,
+                          MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 0x41) != FALSE;  // 'A'
 }
 
 static void StartScreenshot() {
     if (gsticky_shot::IsActive()) return;
+    // 启动时若被占用，每次开始截图再试一次：占用方退出后即自愈。
+    // 仍失败只提示「被占用」——RegisterHotKey 拿不到占用进程，系统无公开查询接口。
+    if (!g_hotkeyShotOk) g_hotkeyShotOk = RegisterShotHotkey();
+    g_shotHotkeyConflict = !g_hotkeyShotOk;
     g_shotNoteVisible = IsWindowVisible(g_note) != FALSE;
     g_shotBallVisible = IsWindowVisible(g_ball) != FALSE;
     ShowWindow(g_note, SW_HIDE);
@@ -864,6 +883,7 @@ static void CleanupAndQuit() {
     KillTimer(g_note, kTimerSave);
     KillTimer(g_note, kTimerFlash);
     UnregisterHotKey(g_note, kHotkeyId);
+    UnregisterHotKey(g_note, kHotkeyShotId);
     if (g_trayOk) Shell_NotifyIconW(NIM_DELETE, &g_nid);
     if (g_ball) DestroyWindow(g_ball);
     if (g_font) DeleteObject(g_font);
@@ -916,6 +936,7 @@ static LRESULT CALLBACK NoteProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_HOTKEY:
         if (wp == kHotkeyId) ToggleNote();
+        else if (wp == kHotkeyShotId) StartScreenshot();
         return 0;
     case kMsgTray: {
         UINT ev = LOWORD(lp);
@@ -1156,6 +1177,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     if (!g_selftest) LoadNote();
     g_hotkeyOk = RegisterHotKey(g_note, kHotkeyId,
                                 MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x47) != FALSE;
+    g_hotkeyShotOk = RegisterShotHotkey();  // 被占用不视为错误：开始截图时重试并提示
     InitTray();
 
     if (g_selftest) {

@@ -1,4 +1,5 @@
 import Cocoa
+import Carbon.HIToolbox
 
 // MARK: - 可调常量
 // 窗口层级：调高即可压在全屏 App 之上。若实测仍被全屏盖住，把数值调大（如 1000）。
@@ -20,6 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var localMonitor: Any?
     private var ballWindow: NSWindow!
     private let noteFrameKey = "noteFrame_v1"
+    private var shotHotKeyRef: EventHotKeyRef?
+    private var shotHotKeyHandlerRef: EventHandlerRef?
 
     // MARK: - 生命周期
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -31,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         setupScreenFollowing()
         loadNote()
         setupHotkey()
+        setupShotHotkey()
         // 应用图标（Finder / 强制退出窗口可见；菜单栏应用无 Dock 图标）
         NSApp.applicationIconImage = NSImage(named: "icon")
     }
@@ -38,6 +42,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         saveNow()
         persistNoteFrame()   // 退出兜底：确保最后一次拖动/缩放一定落盘
+        if let ref = shotHotKeyRef { UnregisterEventHotKey(ref) }
+        if let h = shotHotKeyHandlerRef { RemoveEventHandler(h) }
         return .terminateNow
     }
 
@@ -112,7 +118,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         let menu = NSMenu()
         let toggle = NSMenuItem(title: "显示 / 隐藏便签", action: #selector(toggleWindow), keyEquivalent: "")
-        let shot = NSMenuItem(title: "区域截图（可标注）", action: #selector(startScreenshot), keyEquivalent: "")
+        let shot = NSMenuItem(title: "区域截图（可标注）", action: #selector(startScreenshot), keyEquivalent: "a")
+        shot.keyEquivalentModifierMask = [.command, .shift]
         shot.target = self
         let copyAll = NSMenuItem(title: "复制全部（纯文本）", action: #selector(copyAll), keyEquivalent: "")
         let quit = NSMenuItem(title: "退出 GSticky", action: #selector(quit), keyEquivalent: "q")
@@ -127,10 +134,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     // 区域截图：会话期间隐藏自家便签 / 悬浮球，结束后按原状态精确还原。
     // 圈选由系统 screencapture 完成，标注与 PNG 输出在 Screenshot.swift。
-    @objc private func startScreenshot() {
+    @objc fileprivate func startScreenshot() {
         // 防重入：控制器在会话中会静默拒绝二次 start，若此处仍先隐藏浮层，
         // 便签/悬浮球就会永远消失且收不到 restore 回调。
         if ScreenshotController.shared.isActive { return }
+        // 启动时若被占用，每次开始截图再试一次：占用方退出后即自愈。
+        // 仍冲突只提示「被占用」——系统 API 查不到占用进程。
+        let hotkeyConflict = !registerShotHotKey()
         let noteWasVisible = window.isVisible
         let ballWasVisible = ballWindow.isVisible
         window.orderOut(nil)
@@ -141,7 +151,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard let self else { return }
             if noteVisible { self.window.orderFront(nil) }
             if ballVisible { self.ballWindow.orderFront(nil) }
-            self.flashStatus(title: copied ? "✅ 截图已复制" : "截图已取消")
+            var title = copied ? "✅ 截图已复制" : "截图已取消"
+            if hotkeyConflict { title += " · ⚠️ ⇧⌘A 被其他程序占用" }
+            self.flashStatus(title: title)
         }
     }
 
@@ -286,7 +298,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         ballView.onDragEnd = { [weak self] in self?.persistBallPosition() }
         // 右键菜单：NSView 默认 rightMouseDown 会弹出 view.menu，无需重写事件
         let ballMenu = NSMenu()
-        let shot = NSMenuItem(title: "区域截图（可标注）", action: #selector(startScreenshot), keyEquivalent: "")
+        let shot = NSMenuItem(title: "区域截图（可标注）", action: #selector(startScreenshot), keyEquivalent: "a")
+        shot.keyEquivalentModifierMask = [.command, .shift]
         shot.target = self
         ballMenu.addItem(shot)
         ballView.menu = ballMenu
@@ -359,6 +372,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         saveTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
             self?.saveNow()
         }
+    }
+
+    // MARK: - 截图热键 ⇧⌘A（Carbon 独占注册）
+    // 与 Ctrl+Option+G 的被动监听不同：独占注册能检测冲突（eventHotKeyExistsErr）、
+    // 无需辅助功能权限，且按键不再落到前台 App（应用内同名快捷键被全局接管）。
+    private func setupShotHotkey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), shotHotKeyEventHandler, 1, &spec,
+                            Unmanaged.passUnretained(self).toOpaque(), &shotHotKeyHandlerRef)
+        _ = registerShotHotKey()
+    }
+
+    @discardableResult
+    private func registerShotHotKey() -> Bool {
+        if shotHotKeyRef != nil { return true }
+        var ref: EventHotKeyRef?
+        let id = EventHotKeyID(signature: 0x4753544B, id: 1)   // 'GSTK'
+        let status = RegisterEventHotKey(UInt32(kVK_ANSI_A), UInt32(cmdKey | shiftKey),
+                                         id, GetApplicationEventTarget(), 0, &ref)
+        guard status == noErr, let r = ref else { return false }
+        shotHotKeyRef = r
+        return true
     }
 
     // MARK: - 全局热键
@@ -437,6 +473,15 @@ final class BallView: NSView {
             onDragEnd?()    // 视为拖动 → 记忆落点
         }
     }
+}
+
+// Carbon 热键回调（C 函数指针不能捕获上下文，经 userData 传 AppDelegate）
+private func shotHotKeyEventHandler(_ next: EventHandlerCallRef?, _ event: EventRef?,
+                                    _ userData: UnsafeMutableRawPointer?) -> OSStatus {
+    guard let userData else { return noErr }
+    let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+    delegate.startScreenshot()
+    return noErr
 }
 
 // MARK: - 入口

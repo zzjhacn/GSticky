@@ -636,8 +636,8 @@ static void ShowTrayMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (g_noteVisible ? MF_CHECKED : 0), kIdShow,
                 L"显示 / 隐藏便签  (Ctrl+Alt+G)");
-    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"区域截图（可标注）  (Ctrl+Shift+A)");
-    AppendMenuW(menu, MF_STRING, kIdCopyAll, L"复制全部（纯文本）");
+    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"截图 (Ctrl+Shift+A)");
+    AppendMenuW(menu, MF_STRING, kIdCopyAll, L"复制全部");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (AutoStartEnabled() ? MF_CHECKED : 0), kIdAutoStart,
                 L"开机自启");
@@ -657,7 +657,7 @@ static void ShowBallMenu() {
     GetCursorPos(&pt);
     if (!gsticky_shot::IsActive()) g_fgBeforeMenu = GetForegroundWindow();
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"区域截图（可标注）  (Ctrl+Shift+A)");
+    AppendMenuW(menu, MF_STRING, kIdScreenshot, L"截图 (Ctrl+Shift+A)");
     SetForegroundWindow(g_note);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, pt.x, pt.y, 0, g_note, nullptr);
     PostMessageW(g_note, WM_NULL, 0, 0);
